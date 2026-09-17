@@ -1,0 +1,19 @@
+# The agent runs on the Python standard library alone.
+#
+# All read-only market data goes through public Hyperliquid endpoints, and the
+# indicators are implemented in plain Python. No install is required to run
+# `run_bot.py --show-signal` or `run_bot.py --once` in dry-run mode.
+#
+# PyYAML is the only third-party import and is needed for config loading.
+PyYAML>=6.0
+
+# ---------------------------------------------------------------------------
+# Live trading only. Install these to send real orders.
+#
+#   pip install -r requirements.txt hyperliquid-python-sdk
+#
+# The official SDK is required because order signing, EIP-712 typed data and
+# nonce management are security-critical and should not be reimplemented here.
+# ---------------------------------------------------------------------------
+# hyperliquid-python-sdk>=0.9.0
+# eth-account>=0.11.0

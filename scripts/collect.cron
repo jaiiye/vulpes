@@ -1,0 +1,22 @@
+# Scheduled data collection for the Hyperliquid agent.
+#
+# Install with:
+#   crontab /home/jaiiye/CodeBuddy/20260913183734/scripts/collect.cron
+#
+# Check accumulated progress with:
+#   /home/jaiiye/CodeBuddy/20260913183734/scripts/collect.sh --summary
+#
+# Every 15 minutes. Measured cost per pass:
+#   * ~95 wallet position reads for snapshots + ~95 for the cycle
+#   * the 37 MB leaderboard at most once per 6h (wallet cache TTL)
+#   * ~150s wall time, so the duty cycle is roughly 17%
+#
+# The script holds an exclusive lock, so a run that overruns the interval
+# causes the next invocation to exit immediately rather than stack up.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# min hour day month weekday   command
+*/15 * * * * /home/jaiiye/CodeBuddy/20260913183734/scripts/collect.sh >/dev/null 2>&1

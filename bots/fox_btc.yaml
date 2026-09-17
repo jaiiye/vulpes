@@ -1,0 +1,129 @@
+# Fox-style multi-factor agent, BTC perpetual.
+#
+# The defaults here are deliberately conservative and match the safest
+# settings the 22-agent experiment could support: few signals, long cooldown,
+# low leverage, protective exits enabled.
+
+name: fox_btc
+symbol: BTC
+
+# Start with a preset, then override individual values below.
+# conservative | balanced | aggressive
+risk_preset: conservative
+
+# ---------------------------------------------------------------------------
+# Factor weights. Must be positive; they are normalised to sum to 1.0.
+# The 40/35/25 split mirrors the reference implementation.
+# ---------------------------------------------------------------------------
+weights:
+  smart_money: 0.40
+  technical: 0.35
+  market: 0.25
+
+# ---------------------------------------------------------------------------
+# Technical indicator settings.
+# ---------------------------------------------------------------------------
+indicators:
+  entry_timeframe: 1h
+  trend_timeframe: 4h
+  supertrend_period: 10
+  supertrend_multiplier: 3.0
+  rsi_period: 14
+  adx_period: 14
+  ema_fast: 21
+  ema_slow: 55
+  atr_period: 14
+  lookback_candles: 300
+
+# ---------------------------------------------------------------------------
+# Discipline. This is the Fox layer: the guardrails that matter more than the
+# signal. Every field here is a hard limit, not a preference.
+#
+# Evidence from the 22-agent experiment:
+#   * >400 trades -> every agent lost. <120 trades -> every agent won.
+#   * Same scanner, more signals taken -> 56 points of ROI given up.
+#   * Pure TA -18%, mean reversion -33% / -22%.
+# ---------------------------------------------------------------------------
+discipline:
+  long_threshold: 60.0        # conservative preset
+  short_threshold: 40.0
+  max_signals_per_day: 3      # cap on new entries per symbol per day
+  cooldown_minutes: 240       # minimum gap between entries
+  require_smart_money_alignment: true   # Bison's rule: disagree means no trade
+  btc_trend_filter: true                # no dip-buying while BTC 4h is down
+  btc_trend_timeframe: 4h
+  min_score_gap: 3.0          # ignore signals that barely cross a threshold
+
+# Overall confidence floor. Below this, too many inputs are missing.
+min_confidence: 0.35
+
+# ---------------------------------------------------------------------------
+# Risk. Protective exits are ENABLED here, unlike the upstream template which
+# ships them off. A disabled stop-loss relies on self-discipline at exactly the
+# moment it is least available.
+# ---------------------------------------------------------------------------
+risk:
+  account_allocation_pct: 10.0   # max share of equity as notional
+  leverage: 2                    # experiment winners used low leverage
+  risk_per_trade_pct: 1.0        # risk budget per trade
+  max_position_usd: 0            # 0 = derive from equity
+  stop_loss_enabled: true
+  stop_loss_pct: 3.0
+  take_profit_enabled: true
+  take_profit_pct: 9.0           # 3:1 reward:risk, matching Fox's asymmetry
+  # Peak-to-trough equity drawdown that HALTS new entries. The halt is
+  # persisted, so restarting the process does not bypass it.
+  max_drawdown_pct: 15.0
+  max_open_positions: 1
+
+# Hard backstop that applies even if stop_loss_enabled is turned off.
+safety:
+  hard_stop_pct: 5.0
+
+# ---------------------------------------------------------------------------
+# Execution.
+# ---------------------------------------------------------------------------
+execution:
+  order_type: limit            # limit captures maker fees (0.01% vs 0.035% taker)
+  limit_offset_bps: 5.0
+  slippage_bps: 20.0
+  max_spread_bps: 25.0
+  poll_interval_seconds: 300   # 5 minutes; this is not a scalping bot
+  dry_run: true                # overridden to false only via --live flags
+  testnet: true                # mainnet requires an explicit change
+
+# ---------------------------------------------------------------------------
+# Smart money source: which whale wallets count as "smart".
+#
+# Ranking accounts by ONE window is a luck-contaminated proxy. Measured on live
+# data, the top-25 by "week" and by "month" shared only 11% of their members,
+# and the "day" set collapsed to 2 BTC holders with one wallet at 79.9% of
+# gross notional.
+#
+# So we sample several windows and UNION them. Measured on BTC:
+#
+#   single window, top 25      10 holders   largest position 43.6% of gross
+#   union, hard-filtered >=2    3 holders   45.6%    <- worse
+#   union, unfiltered          18 holders   27.8%    <- what we use
+#
+# Hard-filtering by persistence actually HURTS: the wallets that rank across
+# windows are large diversified accounts that often hold nothing in a given
+# symbol, while the directional traders who do hold it appear in one window
+# only. So persistence is applied as a WEIGHT on each wallet's notional
+# (a 3-window wallet counts 3x), not as a filter.
+# ---------------------------------------------------------------------------
+smart_money:
+  windows: [day, week, month]  # leaderboard windows to rank by
+  top_per_window: 60           # accounts taken from each window (unioned)
+  min_persistence: 1           # 1 = no hard filter; persistence only weights.
+                               # Raise to 2+ for a stricter but smaller set.
+  max_wallets: 150             # cap on candidates (bounds HTTP reads)
+  min_account_value: 10000     # ignore dust accounts; their positions are noise
+  # Manual overrides. Whitelisted wallets are always included and counted as
+  # fully persistent, so a hand-verified track record is never screened out.
+  # whitelist: ["0x..."]
+  # blacklist: ["0x..."]
+
+# Set to true to use the curated Hyperfeed instead of the leaderboard.
+# Requires SENPI_API_KEY to be exported; falls back to the leaderboard if absent.
+use_hyperfeed: false

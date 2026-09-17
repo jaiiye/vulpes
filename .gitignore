@@ -1,0 +1,45 @@
+# Secrets: never commit the private key file.
+# `.env.*` covers the usual `.env.local` / `.env.production` variants, which
+# a bare `.env` pattern would silently let through. The template stays tracked
+# so the expected variable names remain documented.
+.env
+.env.*
+!.env.example
+
+# Runtime output
+logs/
+*.jsonl
+
+# Backtest artifacts
+backtest_cache/
+snapshots/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
