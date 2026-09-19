@@ -109,6 +109,13 @@ DEFAULT_MIN_PERSISTENCE = 1      # 1 = no hard filter, persistence only weights
 DEFAULT_MAX_WALLETS = 150
 MIN_ACCOUNT_VALUE = 10_000.0
 
+#: `userFills` returns at most this many of the newest fills. The cap is what
+#: makes the activity check cheap: a wallet trading thousands of times a day
+#: comes back full and spanning hours, while one trading a few times a day
+#: comes back complete and spanning months. Both are far from any threshold
+#: worth setting, so one request settles the question.
+FILLS_PAGE_LIMIT = 2000
+
 
 @dataclass
 class WalletPosition:
@@ -369,6 +376,8 @@ class LeaderboardWalletSource:
         min_persistence: int = DEFAULT_MIN_PERSISTENCE,
         max_wallets: int = DEFAULT_MAX_WALLETS,
         min_account_value: float = MIN_ACCOUNT_VALUE,
+        max_fills_per_day: float | None = None,
+        min_live_account_value: float | None = None,
         whitelist: list[str] | tuple[str, ...] = (),
         blacklist: list[str] | tuple[str, ...] = (),
     ) -> None:
@@ -378,6 +387,38 @@ class LeaderboardWalletSource:
         self.min_persistence = max(1, int(min_persistence))
         self.max_wallets = max(0, int(max_wallets))
         self.min_account_value = float(min_account_value)
+        # Floor on the account value read from the venue itself, rather than
+        # the one the leaderboard advertises. MEASURED against the live union
+        # of all three windows: 77 wallets survive `min_account_value`, and 59
+        # of them (77%) have a main-dex account value of exactly zero. The
+        # leaderboard's figure spans every venue the account touches, so a
+        # wallet can advertise a billion dollars and hold nothing in the market
+        # this agent trades.
+        #
+        # What this buys, measured rather than assumed: the same 6 BTC
+        # positions either way, but 18 wallets read per snapshot instead of 77.
+        # It does NOT add positions, because the union is well under
+        # `max_wallets`, so the cap never cuts a live account today. An earlier
+        # version of this comment claimed the cap was the problem; the union
+        # was mis-measured at 180, and the claim did not survive checking.
+        #
+        # It remains a hygiene fix with a real efficiency gain, and it makes
+        # `wallets_selected` describe accounts that exist here. None disables
+        # it.
+        self.min_live_account_value = (
+            None if min_live_account_value is None
+            else float(min_live_account_value)
+        )
+        # Optional ceiling on a wallet's trade rate. Ranking by raw PnL favours
+        # whoever books the largest number, and over 417 days of archived fills
+        # that is mostly market makers - 53% of the wallets entering the 30-day
+        # top 60 trade >1,000 times a day. Their positions are inventory rather
+        # than a directional view. Backtested profit factor on 170 days x
+        # BTC/ETH/SOL: 1.03 unfiltered, 1.38 at 200/day, 1.52 at 50/day.
+        # None disables the filter and reproduces the previous behaviour.
+        self.max_fills_per_day = (
+            None if max_fills_per_day is None else float(max_fills_per_day)
+        )
 
         self.whitelist = {str(a).lower() for a in whitelist if a}
         self.blacklist = {str(a).lower() for a in blacklist if a}
@@ -398,6 +439,8 @@ class LeaderboardWalletSource:
             "top_per_window": self.top_per_window,
             "min_persistence": self.min_persistence,
             "max_wallets": self.max_wallets,
+            "max_fills_per_day": self.max_fills_per_day,
+            "min_live_account_value": self.min_live_account_value,
             "whitelist": sorted(self.whitelist),
             "blacklist": sorted(self.blacklist),
         }
@@ -597,6 +640,14 @@ class LeaderboardWalletSource:
                 f"(>= {self.min_persistence} of {len(self.windows)} windows)"
             )
 
+        # --- 3b: activity ceiling -------------------------------------------
+        if self.max_fills_per_day is not None:
+            kept = self._apply_activity_ceiling(kept)
+
+        # --- 3c: live account value -----------------------------------------
+        if self.min_live_account_value is not None:
+            kept = self._apply_live_value_floor(kept)
+
         # --- 4: rank and cap ------------------------------------------------
         kept.sort(key=lambda w: (-w.persistence, -w.account_value))
         if self.max_wallets and len(kept) > self.max_wallets:
@@ -614,6 +665,191 @@ class LeaderboardWalletSource:
     def wallets(self, max_age_seconds: int = WALLET_CACHE_TTL_SECONDS) -> list[str]:
         """Selected wallet addresses. Thin wrapper over `select()`."""
         return [w.address for w in self.select(max_age_seconds)]
+
+    # ------------------------------------------------------------------
+    # Activity ceiling
+    # ------------------------------------------------------------------
+    def _fills_per_day(self, addr: str) -> float | None:
+        """Estimate one wallet's trade rate from its most recent fills.
+
+        `userFills` returns at most `FILLS_PAGE_LIMIT` of the newest fills, and
+        that cap is what makes this affordable: one request answers the only
+        question asked here. A wallet trading thousands of times a day comes
+        back full and spanning hours; a wallet trading a few times a day comes
+        back complete and spanning months. Both are far from any threshold
+        worth setting.
+
+        When the response is at the cap the true rate is at least `len/span`,
+        so the estimate is a floor - a direction that is safe here, because the
+        ceiling only ever rejects wallets above it.
+
+        Returns None when the rate cannot be established.
+        """
+        try:
+            fills = self.market.info({"type": "userFills", "user": addr})
+        except (MarketDataError, HttpError, OSError, ValueError):
+            return None
+        if not isinstance(fills, list) or len(fills) < 2:
+            return None
+
+        times = [
+            int(f.get("time") or 0)
+            for f in fills
+            if isinstance(f, dict) and f.get("time")
+        ]
+        if len(times) < 2:
+            return None
+        span_days = (max(times) - min(times)) / 86_400_000.0
+        # Floor the span at an hour. A burst inside one window would otherwise
+        # divide by ~0; an hour is still far below any sane threshold's
+        # reciprocal, so the comparison it feeds is unaffected.
+        return len(times) / max(span_days, 1.0 / 24.0)
+
+    def _live_account_value(self, addr: str) -> float | None:
+        """Account value as the venue reports it, not as the leaderboard does.
+
+        Returns None when it cannot be read, which the caller treats as
+        "keep" - see `_apply_live_value_floor` for why.
+        """
+        try:
+            state = self.market.info({"type": "clearinghouseState", "user": addr})
+        except (MarketDataError, HttpError, OSError, ValueError):
+            return None
+        if not isinstance(state, dict):
+            return None
+        try:
+            return float(
+                (state.get("marginSummary") or {}).get("accountValue") or 0.0
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_live_value_floor(self, wallets: list[SmartWallet]) -> list[SmartWallet]:
+        """Drop wallets whose account value is zero on this venue.
+
+        Runs before the cap, though on today's data that ordering is not what
+        makes it useful: the union is 77 wallets against a cap of 150, so
+        nothing is being cut either way. It is placed there because the cap
+        sorts by descending leaderboard account value and the empty accounts
+        are exactly the ones advertising the largest numbers, so if the union
+        ever grew past the cap, ordering would decide whether the slots went to
+        live accounts or to empty ones.
+
+        The measured effect is on reads: the same 6 BTC positions, from 18
+        wallets instead of 77.
+
+        Fails open and refuses an empty result, for the same reasons as the
+        activity ceiling: a network blip must not empty the set, because an
+        empty set blocks every trade through the alignment gate.
+        """
+        floor = float(self.min_live_account_value or 0.0)
+        targets = [w for w in wallets if not w.whitelisted]
+        values: dict[str, float | None] = {}
+
+        if targets:
+            workers = min(MAX_WALLET_WORKERS, len(targets))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._live_account_value, w.address): w.address
+                    for w in targets
+                }
+                for future in as_completed(futures):
+                    addr = futures[future]
+                    try:
+                        values[addr] = future.result()
+                    except Exception:  # noqa: BLE001 - isolate per-wallet failure
+                        values[addr] = None
+
+        kept: list[SmartWallet] = []
+        dropped = 0
+        unknown = 0
+        for wallet in wallets:
+            if wallet.whitelisted:
+                kept.append(wallet)
+                continue
+            value = values.get(wallet.address)
+            if value is None:
+                unknown += 1
+                kept.append(wallet)
+            elif value < floor:
+                dropped += 1
+            else:
+                kept.append(wallet)
+
+        if not kept and wallets:
+            self.selection_notes.append(
+                f"live account value floor {floor:,.0f} would have dropped all "
+                f"{len(wallets)} candidates; keeping the unfiltered set"
+            )
+            return wallets
+
+        self.selection_notes.append(
+            f"live account value floor {floor:,.0f} dropped {dropped} wallet(s) "
+            f"with nothing on this venue; {unknown} unreadable and kept"
+        )
+        return kept
+
+    def _apply_activity_ceiling(self, wallets: list[SmartWallet]) -> list[SmartWallet]:
+        """Drop wallets trading faster than the configured ceiling.
+
+        Three properties matter more than the filter itself:
+
+        * **A failed lookup keeps the wallet.** Dropping on an unreadable rate
+          would let a network blip empty the set, and an empty set blocks every
+          trade through the alignment gate. Failing open degrades to today's
+          behaviour instead of to a halt.
+        * **Whitelisted wallets are never measured.** They are hand-verified,
+          and a rule introduced to screen out market makers has no business
+          overriding an explicit choice.
+        * **An empty result is refused.** Same rule as the persistence filter:
+          never silently return nothing when data exists.
+        """
+        ceiling = float(self.max_fills_per_day or 0.0)
+        targets = [w for w in wallets if not w.whitelisted]
+        rates: dict[str, float | None] = {}
+
+        if targets:
+            workers = min(MAX_WALLET_WORKERS, len(targets))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._fills_per_day, w.address): w.address
+                    for w in targets
+                }
+                for future in as_completed(futures):
+                    addr = futures[future]
+                    try:
+                        rates[addr] = future.result()
+                    except Exception:  # noqa: BLE001 - isolate per-wallet failure
+                        rates[addr] = None
+
+        kept: list[SmartWallet] = []
+        dropped = 0
+        unknown = 0
+        for wallet in wallets:
+            if wallet.whitelisted:
+                kept.append(wallet)
+                continue
+            rate = rates.get(wallet.address)
+            if rate is None:
+                unknown += 1
+                kept.append(wallet)
+            elif rate > ceiling:
+                dropped += 1
+            else:
+                kept.append(wallet)
+
+        if not kept and wallets:
+            self.selection_notes.append(
+                f"activity ceiling {ceiling:g} fills/day would have dropped all "
+                f"{len(wallets)} candidates; keeping the unfiltered set"
+            )
+            return wallets
+
+        self.selection_notes.append(
+            f"activity ceiling {ceiling:g} fills/day dropped {dropped} "
+            f"high-frequency wallet(s); {unknown} unmeasurable and kept"
+        )
+        return kept
 
     def _wallet_positions(
         self, addr: str, symbol: str, persistence: int = 1, whitelisted: bool = False
@@ -1017,6 +1253,8 @@ class SmartMoneyFactor:
         min_persistence: int = DEFAULT_MIN_PERSISTENCE,
         max_wallets: int = DEFAULT_MAX_WALLETS,
         min_account_value: float = MIN_ACCOUNT_VALUE,
+        max_fills_per_day: float | None = None,
+        min_live_account_value: float | None = None,
         whitelist: list[str] | tuple[str, ...] = (),
         blacklist: list[str] | tuple[str, ...] = (),
     ) -> None:
@@ -1035,6 +1273,8 @@ class SmartMoneyFactor:
             min_persistence=min_persistence,
             max_wallets=max_wallets,
             min_account_value=min_account_value,
+            max_fills_per_day=max_fills_per_day,
+            min_live_account_value=min_live_account_value,
             whitelist=whitelist,
             blacklist=blacklist,
         )
@@ -1155,6 +1395,8 @@ def smart_money_factor_from_config(
         top_per_window=sm.top_per_window,
         min_persistence=sm.min_persistence,
         max_wallets=sm.max_wallets,
+        max_fills_per_day=sm.max_fills_per_day,
+        min_live_account_value=sm.min_live_account_value,
         min_account_value=sm.min_account_value,
         whitelist=sm.whitelist,
         blacklist=sm.blacklist,

@@ -119,8 +119,28 @@ smart_money:
                                # Raise to 2+ for a stricter but smaller set.
   max_wallets: 150             # cap on candidates (bounds HTTP reads)
   min_account_value: 10000     # ignore dust accounts; their positions are noise
+  # Exclude wallets trading faster than this many fills per day. Ranking by raw
+  # PnL otherwise selects market makers: of the wallets entering the 30-day
+  # top 60 over 417 archived days, 53% trade >1000 times a day and 86% >200,
+  # while 0.4% trade <10. Their positions are inventory, not a directional
+  # view. Backtested on 170 days x BTC/ETH/SOL, profit factor by ceiling:
+  #   none 1.03 | 200/day 1.38 | 50/day 1.52 | 10/day 1.47
+  # Set to null to disable and reproduce the previous behaviour exactly.
+  max_fills_per_day: 50
+  # Floor on the account value the VENUE reports, not the leaderboard's own
+  # number. Measured on the live union of all three windows: 77 wallets pass
+  # min_account_value, and 59 of them (77%) have a main-dex value of exactly
+  # zero while advertising hundreds of millions on the leaderboard - that
+  # figure spans every venue the account touches.
+  # Effect measured, not assumed: the same positions, read from 18 wallets per
+  # snapshot instead of 77. It does not add positions, because the union sits
+  # well under max_wallets, so the cap is not cutting anything today.
+  # Set to null to disable.
+  min_live_account_value: 10000
   # Manual overrides. Whitelisted wallets are always included and counted as
   # fully persistent, so a hand-verified track record is never screened out.
+  # They also bypass the activity ceiling above, which is a screen for market
+  # makers rather than a judgement on a hand-picked wallet.
   # whitelist: ["0x..."]
   # blacklist: ["0x..."]
 

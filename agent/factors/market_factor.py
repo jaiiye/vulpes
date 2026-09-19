@@ -1,17 +1,28 @@
 """Market structure factor.
 
-Reads funding rate, open interest and 24h price change to judge crowding.
+Reads funding rate, 24h price change and open interest to judge crowding.
 
 Hyperliquid settles funding *hourly*, which makes this a much faster signal
-than on an 8-hour CEX schedule. Two distinct reads are combined:
+than on an 8-hour CEX schedule. Two reads are combined:
 
 1. Crowding: extreme funding means the side paying is crowded, which is a
    contrarian signal over a multi-hour horizon.
-2. Regime: a large concurrent rise in open interest and price means fresh
-   leveraged money is chasing the move, which is a momentum signal.
+2. Momentum: the 24h price change.
 
 These pull in opposite directions by design, so the factor reports the net
 and lowers confidence when they conflict.
+
+Open interest is read and recorded on every cycle but is deliberately NOT part
+of the score. The hypothesis - a concurrent rise in open interest and price
+means fresh leveraged money is chasing the move - has never been evaluated
+against this system's own data, and it cannot be evaluated in the backtest at
+all, because `backtest/market.py` has no historical open interest and reports
+zero. Recording the growth now is what makes that evaluation possible later;
+scoring it now would be a guess dressed up as a signal.
+
+An earlier version of this docstring described the open interest read as an
+implemented "regime" input, while `oi_growth` was computed and then discarded
+into a log string. The computation was real, the claim was not.
 """
 
 from __future__ import annotations
@@ -81,16 +92,29 @@ class MarketFactor:
         change = ctx.day_change_pct
         momentum_score = 50.0 + max(-50.0, min(50.0, change * 1.5))
 
-        # --- Open interest ---------------------------------------------
+        # --- Open interest: recorded, not scored ------------------------
+        # Recorded in `details` so the journal accumulates a machine-readable
+        # series. It is intentionally absent from `score` and `confidence`:
+        # the hypothesis is unevaluated, and it cannot be backtested at all,
+        # because historical open interest does not exist.
+        #
+        # `_prev_oi` lives in this process, so `oi_growth_pct` is only
+        # meaningful when one process evaluates repeatedly. The scheduled
+        # deployment runs `run_bot.py --cycles 1` every 15 minutes, so every
+        # evaluate() sees an empty `_prev_oi` and the growth reads exactly 0.0
+        # in production. That is not a signal of "no change"; it is the
+        # absence of a previous reading. Derive growth offline from
+        # consecutive `open_interest_usd` records, which is the durable series.
         prev = self._prev_oi.get(name)
-        oi_growth = 0.0
+        oi_growth_pct = 0.0
         if prev and prev > 0:
-            oi_growth = (oi_notional - prev) / prev * 100
+            oi_growth_pct = (oi_notional - prev) / prev * 100
         self._prev_oi[name] = oi_notional
+        details["oi_growth_pct"] = round(oi_growth_pct, 4)
 
         reasons.append(f"24h change {change:+.2f}%, open interest ${oi_notional / 1e6:,.1f}M")
-        if oi_growth:
-            reasons.append(f"OI change since last tick {oi_growth:+.2f}%")
+        if oi_growth_pct:
+            reasons.append(f"OI change since last tick {oi_growth_pct:+.2f}%")
 
         # Blend: crowding dominates when funding is extreme, otherwise price momentum.
         crowding_weight = min(0.65, 0.30 + abs(funding_bps) / FUNDING_EXTREME_BPS * 0.35)

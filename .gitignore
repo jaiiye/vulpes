@@ -14,6 +14,12 @@ logs/
 backtest_cache/
 snapshots/
 
+# Research data store (datalake). Holds archived and forward-collected market
+# data measured in gigabytes, none of which is reproducible from the repo and
+# none of which belongs in git history. The `datalake/` package that reads and
+# writes it IS tracked - only the data is ignored.
+data/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -43,3 +49,8 @@ htmlcov/
 .idea/
 *.swp
 .DS_Store
+
+# Local IDE / agent state, deliberately kept out of the repository. It holds
+# per-machine automation state rather than anything the project needs to build
+# or run, and committing it would mean every machine fighting over one copy.
+.codebuddy/

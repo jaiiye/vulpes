@@ -143,6 +143,7 @@ class Backtester:
         include_smart_money: bool = False,
         whale_history: dict | None = None,
         wallet_persistence: dict[str, int] | None = None,
+        whale_max_age_ms: int | None = None,
     ) -> None:
         self.cfg = config
         self.symbol = config.symbol.upper()
@@ -166,23 +167,62 @@ class Backtester:
         if whale_history:
             # Reconstructed whale positions let the 40% factor actually run,
             # scored by the live factor's own evaluate().
+            # The staleness window belongs to the data source, not to the
+            # engine. It defaults to the funding-derived value (hourly records,
+            # so six hours tolerates a few missed settlements), but daily
+            # snapshots need a window measured in days - at six hours the book
+            # reads empty for all but one bar in twenty-four, and it does so
+            # silently, with the factor simply reporting no positions.
+            smart_money_kwargs: dict = {
+                "price_lookup": lambda _ts: self.market.mid_price(self.symbol),
+                "persistence": wallet_persistence or {},
+                "window_count": len(config.smart_money.windows),
+            }
+            if whale_max_age_ms is not None:
+                smart_money_kwargs["max_age_ms"] = int(whale_max_age_ms)
             self.smart_money_source = HistoricalSmartMoney(
-                whale_history,
-                price_lookup=lambda _ts: self.market.mid_price(self.symbol),
-                persistence=wallet_persistence or {},
-                window_count=len(config.smart_money.windows),
+                whale_history, **smart_money_kwargs
             )
             self.synth.smart_money = self.smart_money_source
-            self.warnings.append(
-                f"smart money factor INCLUDED from reconstructed funding "
-                f"history: {len(whale_history)} wallets. Coverage is well below "
-                "production, so its contribution is under-powered."
-            )
-            self.warnings.append(
-                "per-wallet unrealised PnL cannot be reconstructed, so the "
-                "wallet-quality confidence term is excluded and the remaining "
-                "weights are renormalised. The live agent keeps that term."
-            )
+
+            # Whether the wallet-quality confidence term can be computed depends
+            # on the source, not on the fact that whale history exists. The
+            # funding-derived series carry no entry price; the Reservoir
+            # snapshots do. Reporting the funding case unconditionally told
+            # every snapshot-backed run that a term was excluded when it was
+            # not - a claim about the run that was simply false.
+            with_entry = sum(1 for s in whale_history.values() if s.has_pnl)
+            if with_entry == len(whale_history) and whale_history:
+                self.warnings.append(
+                    f"smart money factor INCLUDED from {len(whale_history)} "
+                    "reconstructed wallets, each with an entry price, so the "
+                    "wallet-quality confidence term comes from real unrealised "
+                    "PnL - the same term the live agent uses."
+                )
+            elif with_entry:
+                self.warnings.append(
+                    f"smart money factor INCLUDED from {len(whale_history)} "
+                    f"reconstructed wallets; {with_entry} carry an entry price. "
+                    "A snapshot with any position from a wallet lacking one "
+                    "reports PnL as unavailable and the quality term is dropped."
+                )
+            else:
+                self.warnings.append(
+                    f"smart money factor INCLUDED from {len(whale_history)} "
+                    "reconstructed wallets, none with an entry price, so the "
+                    "wallet-quality confidence term is excluded and the "
+                    "remaining weights are renormalised."
+                )
+
+            # No claim is made here about how the wallet set was chosen. The
+            # engine receives a dict of series and cannot tell whether it came
+            # from a PnL ranking or a size filter - and an earlier version
+            # asserted "selected by position size and persistence" regardless,
+            # which became false the moment a leaderboard-backed source was
+            # added. The loaders state their own basis, and the CLI prints it.
+            #
+            # What the engine *can* verify is whether entry prices are present,
+            # so that is the only thing it reports.
         elif not include_smart_money:
             self.synth.smart_money = NullSmartMoney(self._smart_money_gap_reason())
 

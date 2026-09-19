@@ -60,27 +60,70 @@ class HistoricalSmartMoney:
         self._now_ms = int(ts_ms)
 
     # ------------------------------------------------------------------
+    def _persistence_for(self, wallet: str, series) -> int:
+        """Cross-window rank count for this wallet, as of the clock time.
+
+        A reconstructed ranking is per-day - a wallet ranks in all three
+        windows today and none tomorrow - so the series carries its own value
+        and it wins over the run-wide map. The map is the fallback for the
+        funding-derived history, where no ranking exists to read.
+        """
+        if series.persistences:
+            value = series.persistence_at(self._now_ms, self.max_age_ms)
+            if value is not None:
+                return max(1, int(value))
+        return self.persistence.get(wallet.lower(), 1)
+
     def build_snapshot(self, symbol: str) -> SmartMoneySnapshot:
-        """Aggregate every wallet's reconstructed position at the clock time."""
+        """Aggregate every wallet's reconstructed position at the clock time.
+
+        Notional is marked at the **current** price, not at the price recorded
+        in the snapshot. The entry price is a historical fact that does not
+        change, but a snapshot's own notional is stale by up to a day; marking
+        at the bar's price keeps unrealised PnL as-of the bar being replayed.
+        """
         price = self.price_lookup(self._now_ms)
         positions: list[WalletPosition] = []
+        pnl_known = 0
 
         for wallet, series in self.history.items():
             size = series.position_at(self._now_ms, self.max_age_ms)
             if size is None or size == 0:
                 continue
+
+            entry = (
+                series.entry_at(self._now_ms, self.max_age_ms)
+                if series.has_pnl
+                else None
+            )
+            notional = size * price  # Signed, matching the live convention.
+
+            if entry is None or entry <= 0:
+                # Funding-derived history carries no entry price, so PnL is
+                # unknown rather than zero.
+                entry = 0.0
+                pnl = 0.0
+            else:
+                pnl = notional - size * entry
+                pnl_known += 1
+
             positions.append(
                 WalletPosition(
                     wallet=wallet,
                     size=size,
-                    # Signed notional, matching the live convention.
-                    notional=size * price,
-                    entry_price=0.0,
-                    persistence=self.persistence.get(wallet.lower(), 1),
+                    notional=notional,
+                    entry_price=entry,
+                    unrealized_pnl=pnl,
+                    persistence=self._persistence_for(wallet, series),
                 )
             )
 
         selected = len(self.history)
+        # Available only when every included position carries it. A partial
+        # answer would mix a real `winner_ratio` with a guessed one and report
+        # the mixture as measured.
+        pnl_available = bool(positions) and pnl_known == len(positions)
+
         return SmartMoneySnapshot(
             symbol=symbol.upper(),
             positions=positions,
@@ -95,10 +138,7 @@ class HistoricalSmartMoney:
                 if positions
                 else 0.0
             ),
-            # Funding history carries no entry price, so unrealised PnL cannot
-            # be reconstructed. Declaring that lets the scorer drop the quality
-            # term instead of reading a fabricated 0.0 as "all break-even".
-            pnl_available=False,
+            pnl_available=pnl_available,
         )
 
     def snapshot(self, symbol: str, force: bool = False) -> SmartMoneySnapshot:

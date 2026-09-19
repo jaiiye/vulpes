@@ -49,26 +49,28 @@ from agent.synthesizer import LONG, NEUTRAL, SHORT, Synthesizer  # noqa: E402
 def make_wallet_source(market=None, rows=None, **overrides):
     """Build a LeaderboardWalletSource wired for offline tests.
 
-    Bypasses __init__ so tests can inject a row list and avoid the 37 MB
-    leaderboard download, while still setting every attribute the selection
-    logic touches.
+    Goes through `__init__` rather than around it. The previous version used
+    `__new__` and then set fields by hand, promising in its docstring to set
+    "every attribute the selection logic touches" - a promise that has to be
+    re-kept by hand on every change, and one that had already lapsed: adding
+    `max_fills_per_day` left `select()` raising AttributeError in twenty tests.
+
+    `cache_path=None` is what keeps this offline. `__init__` reads no
+    leaderboard and touches no disk in that case, so the real constructor is
+    usable here and the attribute list can never drift again.
     """
     from agent.factors.smart_money import LeaderboardWalletSource
 
-    src = LeaderboardWalletSource.__new__(LeaderboardWalletSource)
-    src.market = market
-    src.windows = ("day", "week", "month")
-    src.top_per_window = 25
-    src.min_persistence = 1
-    src.max_wallets = 0
-    src.min_account_value = 10_000.0
-    # Normalised to lowercase sets exactly as __init__ does.
-    src.whitelist = {str(a).lower() for a in overrides.pop("whitelist", ()) if a}
-    src.blacklist = {str(a).lower() for a in overrides.pop("blacklist", ()) if a}
-    src.cache_path = None
-    src._wallet_cache = []
-    src._cache_time = 0.0
-    src.selection_notes = []
+    src = LeaderboardWalletSource(
+        market,
+        cache_path=None,
+        top_per_window=25,
+        min_persistence=1,
+        max_wallets=0,
+        min_account_value=10_000.0,
+        whitelist=overrides.pop("whitelist", ()),
+        blacklist=overrides.pop("blacklist", ()),
+    )
     if rows is not None:
         src.leaderboard_rows = lambda: rows
     for key, value in overrides.items():
@@ -352,10 +354,45 @@ class TestMarketFactor(unittest.TestCase):
         score = f.evaluate("BTC")
         self.assertGreater(score.score, 50)
 
-    def test_oi_euristic_does_not_crash_on_zero_reference(self):
+    def test_oi_heuristic_does_not_crash_on_zero_reference(self):
         f = MarketFactor(FakeMarket(FakeContext(funding=0.0001, oi=0.0)))
         score = f.evaluate("BTC")
         self.assertTrue(0 <= score.score <= 100)
+
+    def test_first_evaluation_in_a_process_reports_zero_growth(self):
+        """The scheduled deployment runs one cycle per process, so this is the
+        value production actually sees. It means "no previous reading", not
+        "no change" - which is why `details["open_interest_usd"]` is the series
+        to difference offline rather than `oi_growth_pct`."""
+        f = MarketFactor(FakeMarket(FakeContext(oi=50.0)))
+        self.assertEqual(f.evaluate("BTC").details["oi_growth_pct"], 0.0)
+
+    def test_open_interest_is_recorded_but_neither_scored_nor_confidenced(self):
+        """Locks in the deliberate gap: the hypothesis is unevaluated and
+        cannot be backtested, so it must not move the output yet."""
+        ctx = FakeContext(funding=0.0005, oi=50.0, mark=100.0)
+        f = MarketFactor(FakeMarket(ctx))
+
+        first = f.evaluate("BTC")
+        self.assertEqual(first.details["oi_growth_pct"], 0.0)
+
+        # Same process, so a previous reading now exists and growth is real.
+        ctx.open_interest = 60.0  # +20% notional at a constant mark price
+        second = f.evaluate("BTC")
+
+        self.assertAlmostEqual(second.details["oi_growth_pct"], 20.0, places=4)
+        self.assertAlmostEqual(
+            second.score,
+            first.score,
+            places=9,
+            msg="open interest must not move the score",
+        )
+        self.assertAlmostEqual(
+            second.confidence,
+            first.confidence,
+            places=9,
+            msg="open interest must not move confidence",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +1002,238 @@ class TestNotionalSignConvention(unittest.TestCase):
         snap = self.snapshot(positions)
         self.assertGreater(snap.short_notional, 0)
         self.assertLess(snap.long_ratio_pct, 100.0)
+
+
+class TestLeaderboardActivityCeiling(unittest.TestCase):
+    """The activity ceiling changes which wallets the live agent follows.
+
+    Ranking by raw PnL selects market makers: over 417 archived days, 53% of
+    the wallets entering the 30-day top 60 trade more than 1,000 times a day.
+    Their positions are inventory, not a directional view. Backtested profit
+    factor on 170 days x BTC/ETH/SOL: 1.03 unfiltered, 1.38 at 200/day, 1.52 at
+    50/day.
+
+    The three properties asserted here matter more than the filter: a failed
+    lookup must not drop a wallet, a whitelisted wallet must not be screened,
+    and an all-rejected result must not be returned empty.
+    """
+
+    DAY_MS = 86_400_000
+
+    def source(self, **kwargs):
+        from agent.factors.smart_money import LeaderboardWalletSource
+
+        class FakeMarket:
+            testnet = False
+
+            def __init__(self, fills):
+                self.fills = fills
+
+            def info(self, payload):  # noqa: D102 - test double
+                addr = payload.get("user")
+                if isinstance(self.fills, Exception):
+                    raise self.fills
+                return self.fills.get(addr, [])
+
+        market = FakeMarket(kwargs.pop("fills", {}))
+        return LeaderboardWalletSource(market, cache_path=None, **kwargs)
+
+    def capped_response(self):
+        """2000 fills inside one hour - the shape a market maker returns."""
+        from agent.factors.smart_money import FILLS_PAGE_LIMIT
+
+        start = 1_700_000_000_000
+        return [
+            {"time": start + i * 1000} for i in range(FILLS_PAGE_LIMIT)
+        ]  # 2000 fills over ~33 minutes
+
+    def sparse_response(self):
+        """40 fills across four months - a directional trader."""
+        start = 1_700_000_000_000
+        return [
+            {"time": start + i * 3 * self.DAY_MS} for i in range(40)
+        ]  # ~0.33 fills/day
+
+    def test_a_capped_response_reads_as_high_frequency(self):
+        src = self.source(fills={"0xaa": self.capped_response()})
+        rate = src._fills_per_day("0xaa")
+        self.assertIsNotNone(rate)
+        self.assertGreater(rate, 1000)
+
+    def test_a_sparse_response_reads_as_low_frequency(self):
+        src = self.source(fills={"0xaa": self.sparse_response()})
+        rate = src._fills_per_day("0xaa")
+        self.assertIsNotNone(rate)
+        self.assertLess(rate, 1.0)
+
+    def test_an_empty_response_yields_no_rate(self):
+        src = self.source(fills={"0xaa": []})
+        self.assertIsNone(src._fills_per_day("0xaa"))
+
+    def test_a_single_fill_yields_no_rate(self):
+        """One fill gives no span, so no rate - and the caller keeps the
+        wallet rather than guessing."""
+        src = self.source(fills={"0xaa": [{"time": 1_700_000_000_000}]})
+        self.assertIsNone(src._fills_per_day("0xaa"))
+
+    def test_a_failed_request_yields_no_rate_and_keeps_the_wallet(self):
+        """Failing open degrades to today's behaviour. Failing closed would
+        empty the set, and an empty set blocks every trade."""
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source(fills=RuntimeError("network down"),
+                          max_fills_per_day=50)
+        kept = src._apply_activity_ceiling([SmartWallet(address="0xaa")])
+        self.assertEqual([w.address for w in kept], ["0xaa"])
+        self.assertIn("unmeasurable and kept", src.selection_notes[-1])
+
+    def test_wallets_above_the_ceiling_are_dropped(self):
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source(
+            fills={"0xfast": self.capped_response(),
+                   "0xslow": self.sparse_response()},
+            max_fills_per_day=50,
+        )
+        kept = src._apply_activity_ceiling(
+            [SmartWallet(address="0xfast"), SmartWallet(address="0xslow")]
+        )
+        self.assertEqual([w.address for w in kept], ["0xslow"])
+
+    def test_whitelisted_wallets_bypass_the_ceiling(self):
+        """The ceiling screens for market makers. It has no business
+        overriding a hand-verified wallet."""
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source(fills={"0xfast": self.capped_response()},
+                          max_fills_per_day=50)
+        kept = src._apply_activity_ceiling(
+            [SmartWallet(address="0xfast", whitelisted=True)]
+        )
+        self.assertEqual([w.address for w in kept], ["0xfast"])
+
+    def test_rejecting_everything_falls_back_to_the_unfiltered_set(self):
+        """Same rule as the persistence filter: never silently return
+        nothing when data exists."""
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source(fills={"0xfast": self.capped_response()},
+                          max_fills_per_day=50)
+        kept = src._apply_activity_ceiling([SmartWallet(address="0xfast")])
+        self.assertEqual([w.address for w in kept], ["0xfast"])
+        self.assertIn("would have dropped all", src.selection_notes[-1])
+
+    def test_the_ceiling_is_off_by_default(self):
+        """Production's behaviour must not change unless a config asks."""
+        self.assertIsNone(self.source().max_fills_per_day)
+
+    def test_the_ceiling_is_part_of_the_cache_signature(self):
+        """A cached selection built without a ceiling must not be reused for a
+        run that has one."""
+        base = self.source()._cache_signature()
+        capped = self.source(max_fills_per_day=50)._cache_signature()
+        self.assertIsNone(base["max_fills_per_day"])
+        self.assertEqual(capped["max_fills_per_day"], 50.0)
+        self.assertNotEqual(base, capped)
+
+
+class TestLiveAccountValueFloor(unittest.TestCase):
+    """Screen on the venue's account value, not the leaderboard's.
+
+    MEASURED on the live 180-wallet union (three windows, top 60 each): 62%
+    report a main-dex account value of exactly zero and 71% hold no position
+    there, while the same wallets advertise hundreds of millions on the
+    leaderboard - that number spans every venue the account touches.
+
+    The ordering is the load-bearing part. `max_wallets` sorts by descending
+    leaderboard account value, so the empty accounts, advertising the largest
+    numbers, are never the ones cut; the cap cuts the smaller, live accounts
+    that could actually contribute a position. Filtering first hands those
+    slots back.
+    """
+
+    def source(self, states, **kwargs):
+        from agent.factors.smart_money import LeaderboardWalletSource
+
+        class FakeMarket:
+            testnet = False
+
+            def info(self, payload):  # noqa: D102 - test double
+                if isinstance(states, Exception):
+                    raise states
+                return states.get(payload.get("user"), {})
+
+        return LeaderboardWalletSource(
+            FakeMarket(), cache_path=None, **kwargs
+        )
+
+    def state(self, account_value):
+        return {"marginSummary": {"accountValue": str(account_value)}}
+
+    def test_value_is_read_from_the_venue_response(self):
+        src = self.source({"0xaa": self.state(250_000)})
+        self.assertAlmostEqual(src._live_account_value("0xaa"), 250_000.0)
+
+    def test_a_missing_margin_summary_reads_as_zero_not_an_error(self):
+        src = self.source({"0xaa": {}})
+        self.assertAlmostEqual(src._live_account_value("0xaa"), 0.0)
+
+    def test_a_failed_read_yields_none_and_keeps_the_wallet(self):
+        """Failing open, for the same reason as the activity ceiling: a
+        network blip must not empty the set, because an empty set blocks every
+        trade through the alignment gate."""
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source(RuntimeError("network down"), min_live_account_value=10_000)
+        kept = src._apply_live_value_floor([SmartWallet(address="0xaa")])
+        self.assertEqual([w.address for w in kept], ["0xaa"])
+        self.assertIn("unreadable and kept", src.selection_notes[-1])
+
+    def test_accounts_with_nothing_on_the_venue_are_dropped(self):
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source(
+            {"0xempty": self.state(0), "0xlive": self.state(50_000)},
+            min_live_account_value=10_000,
+        )
+        kept = src._apply_live_value_floor(
+            [SmartWallet(address="0xempty"), SmartWallet(address="0xlive")]
+        )
+        self.assertEqual([w.address for w in kept], ["0xlive"])
+
+    def test_a_value_exactly_at_the_floor_is_kept(self):
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source({"0xaa": self.state(10_000)}, min_live_account_value=10_000)
+        kept = src._apply_live_value_floor([SmartWallet(address="0xaa")])
+        self.assertEqual([w.address for w in kept], ["0xaa"])
+
+    def test_whitelisted_wallets_bypass_the_floor(self):
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source({"0xaa": self.state(0)}, min_live_account_value=10_000)
+        kept = src._apply_live_value_floor(
+            [SmartWallet(address="0xaa", whitelisted=True)]
+        )
+        self.assertEqual([w.address for w in kept], ["0xaa"])
+
+    def test_dropping_everything_falls_back_to_the_unfiltered_set(self):
+        from agent.factors.smart_money import SmartWallet
+
+        src = self.source({"0xaa": self.state(0)}, min_live_account_value=10_000)
+        kept = src._apply_live_value_floor([SmartWallet(address="0xaa")])
+        self.assertEqual([w.address for w in kept], ["0xaa"])
+        self.assertIn("would have dropped all", src.selection_notes[-1])
+
+    def test_the_floor_is_off_by_default(self):
+        self.assertIsNone(self.source({}).min_live_account_value)
+
+    def test_the_floor_is_part_of_the_cache_signature(self):
+        base = self.source({})._cache_signature()
+        floored = self.source({}, min_live_account_value=10_000)._cache_signature()
+        self.assertIsNone(base["min_live_account_value"])
+        self.assertEqual(floored["min_live_account_value"], 10_000.0)
+        self.assertNotEqual(base, floored)
 
 
 class TestLeaderboardParsing(unittest.TestCase):

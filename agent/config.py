@@ -172,6 +172,40 @@ class SmartMoneySettings:
     max_wallets: int = 150
     # Accounts below this value are ignored; their positions are noise.
     min_account_value: float = 10_000.0
+    # Exclude wallets trading faster than this many fills per day.
+    #
+    # Ranking by raw PnL favours whoever books the largest number, and measured
+    # over 417 days of archived fills that is overwhelmingly market makers: of
+    # the wallets entering the 30-day PnL top 60, 53% trade more than 1,000
+    # times a day and 86% more than 200, while under 0.4% trade fewer than ten.
+    # A market maker's position is inventory, not a directional view, so half
+    # the wallet set carries no signal about where the market is going.
+    #
+    # Backtested on 170 days x BTC/ETH/SOL (profit factor, 3 markets pooled):
+    #   no ceiling  1.03   |  200/day  1.38  |  50/day  1.52  |  10/day  1.47
+    # The peak is broad and the curve is monotone up to it, which is why 50 is
+    # the default here rather than the strictest value tested.
+    #
+    # `None` disables the filter and reproduces the previous behaviour exactly.
+    # The rate is read from each candidate's most recent fills, one request
+    # apiece, only while the selection cache is cold.
+    max_fills_per_day: float | None = 50.0
+    # Floor on the account value the VENUE reports, rather than the one the
+    # leaderboard advertises. The two disagree badly: measured on the live
+    # union of all three windows, 77 wallets pass `min_account_value` and 59 of
+    # them (77%) have a main-dex account value of exactly zero, while the same
+    # wallets advertise figures in the hundreds of millions. The leaderboard's
+    # number spans every venue the account touches, so it says nothing about
+    # whether the wallet has anything in the market this agent trades.
+    #
+    # Measured effect: the same positions, read from 18 wallets per snapshot
+    # instead of 77. It does not add positions - the union is well under
+    # `max_wallets`, so the cap is not cutting anything today. Treat it as a
+    # hygiene and efficiency fix rather than a signal improvement.
+    #
+    # Costs one `clearinghouseState` read per candidate while the selection
+    # cache is cold. `None` disables the filter.
+    min_live_account_value: float | None = 10_000.0
     # Manual include / exclude lists. Whitelisted wallets always survive the
     # persistence filter, so hand-picked track records are not screened out.
     whitelist: list[str] = field(default_factory=list)
@@ -348,6 +382,17 @@ def _validate(cfg: BotConfig, risk_preset: str | None) -> None:
         )
     if sm.min_account_value < 0:
         raise ConfigError("smart_money.min_account_value must be >= 0")
+    if sm.max_fills_per_day is not None and sm.max_fills_per_day <= 0:
+        # Zero would reject every wallet that trades at all, and the filter
+        # refuses to return an empty set, so it would silently do nothing while
+        # looking like it was on.
+        raise ConfigError(
+            "smart_money.max_fills_per_day must be > 0, or null to disable"
+        )
+    if sm.min_live_account_value is not None and sm.min_live_account_value < 0:
+        raise ConfigError(
+            "smart_money.min_live_account_value must be >= 0, or null to disable"
+        )
 
     for label, addresses in (
         ("whitelist", sm.whitelist),

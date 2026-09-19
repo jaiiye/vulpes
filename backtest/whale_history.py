@@ -40,13 +40,32 @@ DEFAULT_WORKERS = 8
 
 @dataclass
 class WalletPositionSeries:
-    """A wallet's position in one coin over time."""
+    """A wallet's position in one coin over time.
+
+    `points` holds (timestamp, size) and is the only series the funding-based
+    collector produces. The Reservoir snapshots also carry an entry price, so
+    `entries` is a parallel series populated only from that richer source.
+
+    Notional is deliberately not carried: the snapshot's own notional is marked
+    at the snapshot's price and is stale by up to a day. The factor marks at the
+    bar's price instead, so only the entry price - which is a fixed historical
+    fact - needs to survive from the archive.
+    """
 
     wallet: str
     coin: str
     points: list[tuple[int, float]] = field(default_factory=list)
     funding_rates: list[tuple[int, float]] = field(default_factory=list)
+    entries: list[tuple[int, float]] = field(default_factory=list)
+    persistences: list[tuple[int, int]] = field(default_factory=list)
     error: str | None = None
+    #: Timestamp index per series, keyed by `id(list)`. One entry per series
+    #: rather than one shared slot: the snapshot builder calls `position_at`
+    #: and `entry_at` for the same wallet in the same bar, and a single slot
+    #: would have each call evict the other's index.
+    _times_cache: dict[int, list[int]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def __len__(self) -> int:
         return len(self.points)
@@ -57,23 +76,62 @@ class WalletPositionSeries:
             return None
         return self.points[0][0], self.points[-1][0]
 
-    def position_at(self, ts_ms: int, max_age_ms: int) -> float | None:
-        """The position size at `ts_ms`, or None if the data is too stale.
+    @property
+    def has_pnl(self) -> bool:
+        """True when an entry price is available, so PnL can be computed."""
+        return bool(self.entries)
+
+    def _times_for(self, series: list[tuple[int, float]]) -> list[int]:
+        """Cached timestamp list for a series, rebuilt only if it changed size.
+
+        Without this the index is rebuilt on every lookup, which is O(n) per
+        call and runs once per wallet per bar: 150 wallets against 4000 bars
+        turns a 364-point series into hundreds of millions of operations.
+        Series are only ever assigned wholesale, so a length check suffices.
+        """
+        key = id(series)
+        times = self._times_cache.get(key)
+        if times is None or len(times) != len(series):
+            times = [p[0] for p in series]
+            self._times_cache[key] = times
+        return times
+
+    def _at(self, series: list[tuple[int, float]], ts_ms: int,
+            max_age_ms: int) -> float | None:
+        """Most recent value at or before `ts_ms`, if fresh enough.
 
         Staleness is the central failure mode this guards against: the
         22-agent experiment's Scorpion v1 lost by treating months-old
         positions as fresh signals.
         """
-        if not self.points:
+        if not series:
             return None
-        times = [p[0] for p in self.points]
-        idx = bisect.bisect_right(times, ts_ms) - 1
+        idx = bisect.bisect_right(self._times_for(series), ts_ms) - 1
         if idx < 0:
             return None
-        record_ts, size = self.points[idx]
+        record_ts, value = series[idx]
         if ts_ms - record_ts > max_age_ms:
             return None
-        return size
+        return value
+
+    def position_at(self, ts_ms: int, max_age_ms: int) -> float | None:
+        """The position size at `ts_ms`, or None if the data is too stale."""
+        return self._at(self.points, ts_ms, max_age_ms)
+
+    def entry_at(self, ts_ms: int, max_age_ms: int) -> float | None:
+        """The average entry price at `ts_ms`, or None when unavailable."""
+        return self._at(self.entries, ts_ms, max_age_ms)
+
+    def persistence_at(self, ts_ms: int, max_age_ms: int) -> int | None:
+        """How many leaderboard windows this wallet ranked in on that day.
+
+        Per-day rather than fixed, because the live agent reads the ranking as
+        it stands at the moment of the decision. A wallet can rank in all three
+        windows today and none tomorrow, and a single value for the whole run
+        would report whichever of those a caller happened to pick.
+        """
+        value = self._at(self.persistences, ts_ms, max_age_ms)
+        return None if value is None else int(value)
 
     def to_payload(self) -> dict:
         return {
