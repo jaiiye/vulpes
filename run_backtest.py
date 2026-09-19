@@ -20,6 +20,8 @@ flag as statistically meaningless. Three markets over 170 days yield roughly
 from __future__ import annotations
 
 import argparse
+import calendar
+import datetime as dt
 import math
 import sys
 import time
@@ -35,7 +37,11 @@ from backtest.benchmarks import (  # noqa: E402
     random_entry_runs,
     result_return_pct,
 )
-from backtest.data import BacktestDataError, HistoricalLoader  # noqa: E402
+from backtest.data import (  # noqa: E402
+    DEFAULT_CANDLES_ARCHIVE,
+    BacktestDataError,
+    HistoricalLoader,
+)
 from backtest.engine import Backtester  # noqa: E402
 from backtest.metrics import MIN_MEANINGFUL_TRADES, Metrics, compute_metrics  # noqa: E402
 from backtest.leaderboard import LeaderboardError, reconstruct  # noqa: E402
@@ -51,17 +57,40 @@ DEFAULT_CONFIG = "bots/fox_btc.yaml"
 
 BANNER = """
 ================================================================================
- BACKTEST SCOPE
- This replays the live factor code, discipline gates, sizing and exits against
- real historical candles, funding and fees.
+BACKTEST SCOPE
+This replays the live factor code, discipline gates, sizing and exits against
+real historical candles, funding and fees.
 
- NOT INCLUDED: the smart money factor (40% of the live weight). The public
- Hyperliquid API exposes no historical whale positions, so it cannot be
- replayed, and the alignment gate is disabled for the run (otherwise it would
- block every trade). Treat results as testing the remaining ~60% of the model,
- not the deployed strategy.
+{scope}
 ================================================================================
 """
+
+#: Scope text for a run with no whale data. The factor is absent rather than
+#: approximated, so the run exercises the rest of the model and says so.
+SCOPE_NO_WHALES = """NOT INCLUDED: the smart money factor (40% of the live weight). The public
+Hyperliquid API exposes no historical whale positions, so it cannot be
+replayed, and the alignment gate is disabled for the run (otherwise it would
+block every trade). Treat results as testing the remaining ~60% of the model,
+not the deployed strategy."""
+
+#: Scope text for a run backed by the Reservoir snapshots. The factor *is*
+#: replayed here, so the old blanket "not included" was simply false - the same
+#: class of untrue claim as the engine warning that used to announce a
+#: confidence term was dropped while using it. This banner is printed before
+#: any loading happens, so it states the intent and leaves the wallet basis to
+#: the WHALE HISTORY block that follows.
+SCOPE_WHALES = """INCLUDED: the smart money factor (40% of the live weight), replayed from the
+Reservoir position snapshots with the alignment gate on, as live. Note the
+wallet set is reconstructed, not read from the production leaderboard - the
+WHALE HISTORY block below states the basis it actually used."""
+
+#: Scope text for a leaderboard-backed run: the factor *and* the selection rule
+#: are the production ones, so the remaining gaps are narrower and named.
+SCOPE_LEADERBOARD = """INCLUDED: the smart money factor (40% of the live weight) with the alignment
+gate on, and its wallet set rebuilt from the fills archive by trailing
+realised PnL - the production selection rule. Remaining gaps: the archive
+lags live by up to a day, and the account-value floor is omitted because that
+column is not in the research projection."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,6 +137,15 @@ def build_parser() -> argparse.ArgumentParser:
         "Of the wallets entering the PnL top 60, 53%% trade >1000 times a day "
         "and 86%% more than 200.",
     )
+    p.add_argument(
+        "--entry-timeframe",
+        default=None,
+        help="override the config's entry timeframe, e.g. 15m. The trend "
+        "timeframe is left alone, so this changes how often a signal is "
+        "evaluated without changing what it is compared against. Needs "
+        "--candles-archive for anything faster than 1h: the API caps at ~5000 "
+        "bars, which is 52 days at 15m.",
+    )
     p.add_argument("--days", type=int, default=90, help="traded window")
     p.add_argument(
         "--warmup-days",
@@ -127,6 +165,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--no-benchmark", action="store_true", help="skip benchmarks")
     p.add_argument("--cache-dir", default="backtest_cache")
+    p.add_argument(
+        "--candles-archive",
+        nargs="?",
+        const=DEFAULT_CANDLES_ARCHIVE,
+        default=None,
+        help="build candles from the local one-second archive in this "
+        "directory (default: %(const)s) instead of the public API. Off unless "
+        "given. The API caps at ~5000 bars, which is 208 days at 1h and 52 at "
+        "15m, so it cannot supply a second window or a faster timeframe; the "
+        "archive holds 414 days at every interval. Funding still comes from "
+        "the API - the archive has no funding history.",
+    )
+    p.add_argument(
+        "--as-of",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="pin the window to end at the close of this UTC day. Without it "
+        "the window ends at the current time, so two runs on different days "
+        "describe different periods and their numbers are not comparable.",
+    )
     p.add_argument("--quiet", action="store_true", help="suppress progress output")
     return p
 
@@ -140,16 +198,57 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
+    if args.entry_timeframe:
+        # An override rather than a config copy: a duplicated config drifts away
+        # from the real one the moment either is edited, and then the comparison
+        # being reported is not the comparison that was run.
+        from agent.market_data import TIMEFRAME_MS as _TF
+
+        if args.entry_timeframe not in _TF:
+            print(
+                f"bad --entry-timeframe {args.entry_timeframe!r}; known: "
+                f"{', '.join(_TF)}",
+                file=sys.stderr,
+            )
+            return 2
+        config = replace(
+            config,
+            indicators=replace(
+                config.indicators, entry_timeframe=args.entry_timeframe
+            ),
+        )
+
     try:
         requested = _resolve_symbols(args, config)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    print(BANNER)
+    as_of_ms = _as_of_ms(args.as_of)
+    if args.as_of and as_of_ms is None:
+        print(
+            f"bad --as-of value {args.as_of!r}: expected YYYY-MM-DD",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not args.whale_snapshots:
+        scope = SCOPE_NO_WHALES
+    elif args.whale_leaderboard:
+        scope = SCOPE_LEADERBOARD
+    else:
+        scope = SCOPE_WHALES
+    print(BANNER.format(scope=scope))
     print(f"config      : {config.summary()}")
     print(f"symbols     : {', '.join(requested)}")
     print(f"window      : {args.days} days (+{args.warmup_days} warmup)")
+    if as_of_ms is not None:
+        print(f"pinned to   : end of {args.as_of} UTC (reproducible)")
+    else:
+        print(
+            "pinned to   : NOTHING - the window ends at the current time, so "
+            "this run is not comparable with one made later"
+        )
     print(f"initial     : ${args.equity:,.2f}   taker fee {args.fee_bps}bp/leg")
     print()
 
@@ -161,7 +260,14 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             print(msg, flush=True)
 
-    loader = HistoricalLoader(cache_dir=args.cache_dir)
+    try:
+        loader = HistoricalLoader(
+            cache_dir=args.cache_dir,
+            candles_archive=args.candles_archive,
+        )
+    except BacktestDataError as exc:
+        print(f"data error: {exc}", file=sys.stderr)
+        return 1
 
     # BTC is always loaded: the macro filter reads its higher timeframe trend.
     to_load = sorted(set(requested) | {"BTC"})
@@ -176,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                 days=args.days,
                 warmup_days=args.warmup_days,
                 progress=progress,
+                end_ms=as_of_ms,
             )
         except BacktestDataError as exc:
             print(f"data error: {exc}", file=sys.stderr)
@@ -314,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(runs) == 1:
         _report_single_market(runs[0], datasets, config, dataset_warnings, runtime)
     else:
-        _report_pooled(runs, dataset_warnings, runtime)
+        _report_pooled(runs, datasets, config, dataset_warnings, runtime)
 
     return 0
 
@@ -405,7 +512,7 @@ def _report_single_market(run, datasets, config, dataset_warnings, runtime) -> N
     print()
 
 
-def _report_pooled(runs, dataset_warnings, runtime) -> None:
+def _report_pooled(runs, datasets, config, dataset_warnings, runtime) -> None:
     """Compact per-market lines plus a pooled sample.
 
     Pooling is the entire point of `--symbols`. Any single market here yields
@@ -462,6 +569,31 @@ def _report_pooled(runs, dataset_warnings, runtime) -> None:
         )
     print()
 
+    # The percentiles above are only meaningful next to the distribution they
+    # refer to. Without it "pctile 0" reads as a mild miss when it actually
+    # means every one of the random runs did better - which is how this section
+    # was first misread. Print the distribution and the buy-and-hold line here
+    # too, not only in the single-market report.
+    have_bench = any(b is not None for _, _, _, b in runs)
+    if have_bench:
+        print("=== BENCHMARKS ===")
+        for sym, _result, metrics, bench in runs:
+            if bench is None:
+                continue
+            try:
+                hold = buy_and_hold(
+                    datasets[sym], config.indicators.entry_timeframe
+                )
+                hold_txt = f"  buy & hold {hold:+.2f}%"
+            except (KeyError, TypeError):
+                hold_txt = "  buy & hold n/a"
+            print(
+                f"  {sym:6s} strategy {metrics.total_return_pct:+.2f}%"
+                f"   {hold_txt}"
+            )
+            print(f"         {bench.summary()}")
+        print()
+
     if percentiles and all(p < 75 for p in percentiles):
         print(
             "  VERDICT: no market beat random entries, so the pooled result is "
@@ -511,6 +643,23 @@ def _resolve_symbols(args, config) -> list[str]:
     if not symbols:
         raise ValueError("no symbols requested")
     return symbols
+
+
+def _as_of_ms(value: str | None) -> int | None:
+    """Milliseconds at the close of a `YYYY-MM-DD` UTC day, or None.
+
+    Returns None for a missing value (meaning "use the current time") and also
+    for an unparseable one. The caller distinguishes the two by checking
+    whether the flag was supplied at all, so a typo is an error rather than a
+    silently unpinned run.
+    """
+    if not value:
+        return None
+    try:
+        day = dt.datetime.strptime(value.strip(), "%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return None
+    return int(calendar.timegm(day.timetuple()) + 86_399) * 1000
 
 
 def _interval_hours(interval: str) -> float:

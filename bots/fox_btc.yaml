@@ -123,9 +123,23 @@ smart_money:
   # PnL otherwise selects market makers: of the wallets entering the 30-day
   # top 60 over 417 archived days, 53% trade >1000 times a day and 86% >200,
   # while 0.4% trade <10. Their positions are inventory, not a directional
-  # view. Backtested on 170 days x BTC/ETH/SOL, profit factor by ceiling:
-  #   none 1.03 | 200/day 1.38 | 50/day 1.52 | 10/day 1.47
-  # Set to null to disable and reproduce the previous behaviour exactly.
+  # view.
+  #
+  # The wallet-composition measurement above is solid (417 days, every fill).
+  # What follows from it is NOT. An earlier version of this comment cited a
+  # single window where profit factor went 1.03 -> 1.52; that window turned out
+  # to be where the value was chosen, and a walk-forward split (tune on the
+  # first 104 days, evaluate once on the next 104) does not reproduce it:
+  #
+  #              no filter   ceiling=10   no whale data at all
+  #   in-sample      1.30        1.32            -
+  #   out-of-sample  0.43        0.79           1.02
+  #
+  # Two things follow. The ceiling does point the right way - it improves the
+  # factor in both halves - but on the evaluation half even the filtered factor
+  # (0.79) is worse than not using it (1.02). So the 40% weight itself is the
+  # open question, not the ceiling. Left enabled because it is the better of
+  # the two factor configurations, not because it is proven.
   max_fills_per_day: 50
   # Floor on the account value the VENUE reports, not the leaderboard's own
   # number. Measured on the live union of all three windows: 77 wallets pass

@@ -7,10 +7,14 @@ engine is just as untrustworthy as a positive one from an overfitted one.
 
 from __future__ import annotations
 
+import calendar
+import json
 import math
 import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1561,6 +1565,223 @@ class TestSqlTransport(unittest.TestCase):
         self.assertIn('["duckdb", "-json"]', source)
         self.assertIn("input=sql", source)
         self.assertNotIn('"duckdb", "-json", "-c"', source)
+
+
+class TestArchiveCandleLoader(unittest.TestCase):
+    """The candle archive has to be a drop-in replacement for the API.
+
+    Candle source is the binding constraint on every long backtest:
+    `candleSnapshot` caps at ~5000 bars, which is 208 days at 1h and 52 at 15m,
+    and once a window has used that up there is no second window to check it
+    against. The archive holds 414 days at one-second resolution, so it is what
+    makes an out-of-sample window - or any 15m test - possible at all. That only
+    helps if the rebuilt bars are *the same bars*, which is what the parity test
+    at the bottom measures.
+    """
+
+    DAY = 86_400_000
+
+    def make_archive(self, days):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for day in days:
+            (Path(tmp) / f"date={day}.parquet").write_bytes(b"")
+        return tmp
+
+    def loader(self, archive):
+        from backtest.data import HistoricalLoader
+
+        return HistoricalLoader(cache_dir=None, candles_archive=archive)
+
+    # ------------------------------------------------------------------
+    # Partition selection
+    # ------------------------------------------------------------------
+
+    def test_exactly_the_requested_days_are_selected(self):
+        archive = self.make_archive(
+            ["2026-03-01", "2026-03-02", "2026-03-03", "2026-03-04"]
+        )
+        loader = self.loader(archive)
+        start = calendar.timegm(time.strptime("2026-03-02", "%Y-%m-%d"))
+        end = calendar.timegm(time.strptime("2026-03-04", "%Y-%m-%d"))
+        files = loader._archive_files(start * 1000, end * 1000)
+        names = [Path(f).name for f in files]
+        # Both endpoints are inclusive: a window ending at midnight still needs
+        # the bar that opens at that instant.
+        self.assertEqual(
+            names,
+            ["date=2026-03-02.parquet", "date=2026-03-03.parquet",
+             "date=2026-03-04.parquet"],
+        )
+
+    def test_days_the_archive_lacks_are_skipped_not_faked(self):
+        """The archive has a 52-day gap. Missing days must drop out silently
+        here and be reported as a coverage warning later - inventing an empty
+        placeholder would turn a data gap into a bar of garbage."""
+        archive = self.make_archive(["2026-03-01", "2026-03-05"])
+        loader = self.loader(archive)
+        start = calendar.timegm(time.strptime("2026-03-01", "%Y-%m-%d"))
+        end = calendar.timegm(time.strptime("2026-03-05", "%Y-%m-%d"))
+        names = [
+            Path(f).name
+            for f in loader._archive_files(start * 1000, end * 1000)
+        ]
+        self.assertEqual(
+            names, ["date=2026-03-01.parquet", "date=2026-03-05.parquet"]
+        )
+
+    def test_a_missing_archive_directory_names_the_command_to_build_it(self):
+        from backtest.data import BacktestDataError, HistoricalLoader
+
+        with self.assertRaises(BacktestDataError) as ctx:
+            HistoricalLoader(cache_dir=None, candles_archive="/nonexistent/x")
+        self.assertIn("sync_reservoir", str(ctx.exception))
+
+    def test_no_flag_means_the_api_path_is_used(self):
+        from backtest.data import HistoricalLoader
+
+        self.assertIsNone(HistoricalLoader(cache_dir=None).candles_archive)
+
+    # ------------------------------------------------------------------
+    # The query itself
+    # ------------------------------------------------------------------
+
+    def test_bounds_are_compared_as_timestamps_not_as_bare_epochs(self):
+        """White-box, and it is the one mistake that produced plausible garbage.
+
+        The column is TIMESTAMPTZ. Comparing it against `epoch_ms(...)` - which
+        returns a bare TIMESTAMP - casts through the session time zone, so the
+        window silently shifts by the machine's UTC offset and you get real bars
+        from the wrong hours. It looks like wrong data, not like a bug. Measured
+        once: `epoch_ms` gave o=64185 against the API's o=65494 for the same
+        hour, an 8-hour slip on a UTC+8 box.
+        """
+        from backtest import data as data_mod
+
+        sql = data_mod.ARCHIVE_RESAMPLE_SQL
+        self.assertIn("to_timestamp(", sql)
+        self.assertNotIn("epoch_ms(", sql.split("WHERE")[1])
+
+    def test_the_resample_uses_venue_style_first_and_last_ticks(self):
+        """`arg_min`/`arg_max` rather than an average or a midpoint: the open is
+        the first tick's open and the close is the last tick's close, which is
+        how the venue builds its own bars and why the rebuild is exact."""
+        from backtest import data as data_mod
+
+        sql = data_mod.ARCHIVE_RESAMPLE_SQL
+        self.assertIn("arg_min(open, timestamp)", sql)
+        self.assertIn("arg_max(close, timestamp)", sql)
+        self.assertIn("max(high)", sql)
+        self.assertIn("min(low)", sql)
+
+    def test_archive_bars_are_cached_under_a_distinct_key(self):
+        """Sharing the API cache key would hide a divergence between the two
+        sources instead of exposing it - they are supposed to agree, and if they
+        ever stop agreeing that is exactly what must not be papered over."""
+        from backtest.data import HistoricalLoader
+
+        loader = HistoricalLoader(cache_dir="/tmp/x", candles_archive="/tmp")
+        api_key = loader._cache_path("candles", "BTC", "1h", 0, 1000)
+        arc_key = loader._cache_path("arc_candles", "BTC", "1h", 0, 1000)
+        self.assertNotEqual(api_key.name, arc_key.name)
+
+    # ------------------------------------------------------------------
+    # Parity, measured
+    # ------------------------------------------------------------------
+
+    def test_rebuilt_bars_equal_the_api_bars_where_both_exist(self):
+        """The check that makes the archive usable: rebuild bars from the
+        one-second archive and compare against bars the venue itself returned.
+
+        Skipped unless the archive, a cached API response and duckdb are all
+        present - this is an integration check against local data, not
+        something CI can be expected to have. It is also the reason the archive
+        path can be trusted for windows the API cannot reach at all.
+        """
+        from backtest.data import DEFAULT_CANDLES_ARCHIVE, HistoricalLoader
+
+        if shutil.which("duckdb") is None:
+            self.skipTest("duckdb not on PATH")
+        if not Path(DEFAULT_CANDLES_ARCHIVE).is_dir():
+            self.skipTest("no candle archive on this machine")
+
+        cached = sorted(
+            Path("backtest_cache").glob("candles_BTC_1h_*.json"),
+            key=lambda p: -p.stat().st_size,
+        )
+        if not cached:
+            self.skipTest("no cached API candles to compare against")
+
+        payload = json.loads(cached[0].read_text(encoding="utf-8"))
+        stamps = payload["t"]
+        loader = self.loader(DEFAULT_CANDLES_ARCHIVE)
+
+        compared = 0
+        for index in (5, len(stamps) // 2, len(stamps) - 10):
+            ts = stamps[index]
+            series = loader._load_candles_archive(
+                "BTC", "1h", ts, ts + 3_600_000, None, None
+            )
+            # The API bar carries the hour's own timestamp, so match on it.
+            self.assertEqual(series.times[0], ts)
+            self.assertAlmostEqual(series.opens[0], payload["o"][index], places=6)
+            self.assertAlmostEqual(series.highs[0], payload["h"][index], places=6)
+            self.assertAlmostEqual(series.lows[0], payload["l"][index], places=6)
+            self.assertAlmostEqual(series.closes[0], payload["c"][index], places=6)
+            self.assertAlmostEqual(
+                series.volumes[0], payload["v"][index], places=6
+            )
+            compared += 1
+        self.assertEqual(compared, 3)
+
+
+class TestEntryTimeframeOverride(unittest.TestCase):
+    """Changing the entry timeframe must not change anything else.
+
+    The 15m experiment is only interpretable if the timeframe is the single
+    difference: if the trend timeframe moved too, a worse result could be either
+    effect and neither could be attributed. The override is a `replace` on the
+    config rather than a copied config file, because a copy drifts from the real
+    one and then the run being reported is not the run that was configured.
+    """
+
+    def setUp(self):
+        self.cfg_path = write_config(CONFIG)
+        self.addCleanup(os.unlink, self.cfg_path)
+        self.cfg = load_config(self.cfg_path)
+
+    def test_only_the_entry_timeframe_moves(self):
+        from dataclasses import replace as _replace
+
+        before = self.cfg.indicators
+        after = _replace(before, entry_timeframe="15m")
+
+        self.assertEqual(after.entry_timeframe, "15m")
+        self.assertEqual(after.trend_timeframe, before.trend_timeframe)
+        for field in (
+            "supertrend_period",
+            "supertrend_multiplier",
+            "adx_period",
+            "rsi_period",
+            "ema_fast",
+            "ema_slow",
+            "lookback_candles",
+        ):
+            with self.subTest(field=field):
+                self.assertEqual(getattr(after, field), getattr(before, field))
+
+    def test_the_frequency_gates_do_not_scale_with_the_timeframe(self):
+        """`max_signals_per_day` and `cooldown_minutes` are wall-clock limits.
+
+        A cooldown of 240 minutes is 4 bars at 1h and 16 at 15m, so it binds
+        *less* on the finer timeframe - which is why the flat trade count at 15m
+        cannot be explained by these gates. Kept as a test because that is the
+        intuitive explanation and it is the one that turned out to be wrong: the
+        engine's own counters show `daily cap` never fired, and the flat count
+        came from threshold rejections rising instead.
+        """
+        self.assertGreater(self.cfg.discipline.cooldown_minutes, 0)
+        self.assertGreater(self.cfg.discipline.max_signals_per_day, 0)
 
 
 class TestDailyStalenessWindow(unittest.TestCase):
