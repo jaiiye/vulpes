@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field
 
 from .config import BotConfig
+from .indicators import sma
 from .market_data import HyperliquidMarket, safe_candles
 from .synthesizer import LONG, SHORT, Signal
 
@@ -245,6 +246,87 @@ class Discipline:
             )
         return None
 
+    def check_trend_strength(self, signal: Signal) -> str | None:
+        """Require ADX(14) above a floor before taking a directional view.
+
+        ADX measures trend *strength* and carries no direction, so this is a
+        regime gate rather than a directional one: it stands aside while the
+        market chops, which is where an EMA/RSI reading is least meaningful.
+
+        Fails CLOSED when the candles cannot be read. The opposite choice - let
+        the trade through when the reading is unavailable - is how a gate stops
+        running without anyone noticing, and this codebase has been bitten by
+        that three times already. A closed gate shows up as a rejection reason
+        in the counts; an open one shows up nowhere.
+        """
+        floor = self.d.min_adx
+        if floor <= 0:
+            return None
+        series = safe_candles(
+            self.market,
+            signal.symbol,
+            self.cfg.indicators.entry_timeframe,
+            self.cfg.indicators.lookback_candles,
+        )
+        if series is None:
+            return (
+                f"ADX filter on but {signal.symbol} candles are unavailable, so "
+                "trend strength cannot be confirmed"
+            )
+        period = self.cfg.indicators.adx_period
+        if len(series) < period + 2:
+            return (
+                f"ADX filter on but only {len(series)} bars are available "
+                f"(needs {period + 2})"
+            )
+        value = series.adx(period)[-1]
+        if value is None:
+            return "ADX filter on but ADX has no reading yet"
+        if value < floor:
+            return (
+                f"ADX {value:.1f} below the {floor:g} floor: no trend to trade"
+            )
+        return None
+
+    def check_volume(self, signal: Signal) -> str | None:
+        """Require the entry bar's volume to clear a moving average of volume.
+
+        Volume is the only input in this strategy not derived from price, so it
+        is the only one that can corroborate a move rather than restate it.
+
+        Fails CLOSED, for the same reason as `check_trend_strength`.
+        """
+        if not self.d.volume_confirm:
+            return None
+        series = safe_candles(
+            self.market,
+            signal.symbol,
+            self.cfg.indicators.entry_timeframe,
+            self.cfg.indicators.lookback_candles,
+        )
+        if series is None or not series.volumes:
+            return (
+                f"volume confirmation on but {signal.symbol} volume is "
+                "unavailable"
+            )
+        period = int(self.d.volume_ma_period)
+        if period < 2 or len(series.volumes) < period + 1:
+            return (
+                f"volume confirmation on but only {len(series.volumes)} bars "
+                f"are available (needs {period + 1})"
+            )
+        average = sma(series.volumes, period)[-1]
+        if average is None or average <= 0:
+            return "volume confirmation on but the average is not computable"
+        latest = series.volumes[-1]
+        need = average * self.d.volume_multiplier
+        if latest < need:
+            return (
+                f"volume {latest:,.0f} below {self.d.volume_multiplier:g}x the "
+                f"{period}-bar average {average:,.0f}: move not confirmed"
+            )
+        return None
+
     def check_smart_money_alignment(self, signal: Signal) -> str | None:
         """Require the smart money factor to agree with the trade direction.
 
@@ -314,6 +396,12 @@ class Discipline:
             self.check_confidence(signal),
             self.check_smart_money_alignment(signal),
             self.check_macro_filter(signal),
+            # Entry-quality gates. Deliberately before the cap/cooldown block and
+            # outside the reversal exemption: a reversal is still an entry, and
+            # both of these describe the bar being entered on rather than how
+            # recently the symbol was traded.
+            self.check_trend_strength(signal),
+            self.check_volume(signal),
         ]
 
         # Cap and cooldown protect against churn; a reversal that closes an

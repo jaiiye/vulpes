@@ -492,6 +492,8 @@ class FoxAgent:
                 take_profit_price=sizing.take_profit_price,
                 entry_score=signal.score,
                 entry_reasons=signal.reasons,
+                trailing_distance=sizing.trailing_distance,
+                trailing_activation=sizing.trailing_activation,
             )
         except CriticalExecutionError:
             # The broker already recorded the exposure via on_unprotected.
@@ -531,6 +533,24 @@ class FoxAgent:
         if reason:
             self.close_position(self.position, price, reason)
             return
+
+        # Ratchet after the exit check, never before. Raising the stop on this
+        # observation and then testing it against the same observation would
+        # make the trail fire on the tick that raised it.
+        #
+        # Live has a mark price, not a bar, so the observed extreme is the point
+        # itself. That makes the trail coarser than in a backtest, which sees
+        # each bar's high and low - it will give back up to one poll interval of
+        # move. Stated rather than hidden: the live trail is a slightly looser
+        # version of the one that was measured.
+        before = self.position.stop_price
+        self.position.ratchet_stop(price, price)
+        if self.position.stop_price != before:
+            self.log(
+                f"  TRAIL: stop moved {before:.4g} -> {self.position.stop_price:.4g} "
+                f"(best {self.position.best_price:.4g})"
+            )
+            self._persist()
 
         pnl = self.position.unrealized_pnl(price)
         self.log(

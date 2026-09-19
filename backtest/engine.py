@@ -28,7 +28,12 @@ from dataclasses import dataclass, field
 
 from agent.config import BotConfig
 from agent.discipline import Discipline, bucket_block_reason
-from agent.execution import Position, compute_size, is_reversal_signal
+from agent.execution import (
+    ExecutionError,
+    Position,
+    compute_size,
+    is_reversal_signal,
+)
 from agent.factors.base import FactorScore
 from agent.factors.smart_money import SmartMoneySnapshot
 from agent.synthesizer import LONG, SHORT, Synthesizer
@@ -428,11 +433,17 @@ class Backtester:
             sizing = compute_size(
                 self.market, self.cfg, self.symbol, signal.action, price, self.equity
             )
-        except Exception as exc:  # noqa: BLE001 - sizing failure is a skip
+        except ExecutionError as exc:
+            # A sizing *decision* that says no - a size that rounds to zero, a
+            # price that cannot be sized against. That is a skip, not a fault.
             self.blocked[f"sizing failed: {exc}"] = (
                 self.blocked.get(f"sizing failed: {exc}", 0) + 1
             )
             return
+        # Anything else propagates. A blanket `except Exception` here once
+        # turned a mismatched keyword argument into 343 counted "skips" and
+        # zero trades, with no error anywhere: a bug presented itself as a
+        # strategy that simply found nothing to do.
 
         if sizing.size <= 0:
             self.blocked["zero size"] = self.blocked.get("zero size", 0) + 1
@@ -452,6 +463,9 @@ class Backtester:
             entry_score=signal.score,
             is_dry_run=True,
             risk_usd=sizing.risk_usd,
+            trailing_distance=sizing.trailing_distance,
+            trailing_activation=sizing.trailing_activation,
+            best_price=price,
         )
         self.discipline.record_trade(self.symbol)
 
@@ -492,6 +506,19 @@ class Backtester:
             hard = self.cfg.safety.hard_stop_pct
             if pos.pnl_pct(bar.close) <= -abs(hard):
                 self._close(ts, bar.close, "safety stop", bar)
+                return
+
+        # Ratchet the trailing stop LAST, and only if the position survived the
+        # checks above.
+        #
+        # Order matters here. Raising the stop on this bar's high and then
+        # testing it against this bar's low assumes the high came first - and on
+        # a down bar it did not. That produces a same-bar exit at a price the
+        # market never offered, which is the flattering direction. Trailing on
+        # the extremes of a bar whose stop has already been tested makes the
+        # trail take effect from the next bar, which is the honest reading of
+        # what a resting order could have done.
+        self.position.ratchet_stop(bar.high, bar.low)
 
     # ------------------------------------------------------------------
     def _close(self, ts: int, price: float, reason: str, bar: Bar) -> None:

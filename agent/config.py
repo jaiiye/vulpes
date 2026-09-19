@@ -110,6 +110,17 @@ class Discipline:
     btc_trend_filter: bool = True
     btc_trend_timeframe: str = "4h"
     min_score_gap: float = 0.0
+    #: Hard floor on ADX(14). ADX measures trend *strength* without direction,
+    #: so this is a regime gate rather than a directional one: it stands aside
+    #: when the market is chopping and the EMA/RSI reading is least meaningful.
+    #: 0 disables it.
+    min_adx: float = 0.0
+    #: Require the entry bar's volume to exceed a moving average of recent
+    #: volume. Volume is the only input here that is not derived from price, so
+    #: it is the only one that can confirm a move rather than restate it.
+    volume_confirm: bool = False
+    volume_ma_period: int = 20
+    volume_multiplier: float = 1.0
 
 
 @dataclass
@@ -122,6 +133,25 @@ class Risk:
     max_position_usd: float = 0.0  # 0 = derive from account equity
     stop_loss_enabled: bool = False
     stop_loss_pct: float = 3.0
+    #: When > 0, the stop distance is this many ATRs instead of `stop_loss_pct`
+    #: percent of price. Volatility-scaled rather than fixed: a 3% stop is wide
+    #: on a quiet day and inside the noise on a violent one, and BTC spends time
+    #: in both. `stop_loss_pct` is ignored when this is set.
+    stop_loss_atr_multiple: float = 0.0
+    #: When > 0, the stop ratchets behind the best price reached since entry,
+    #: held this many ATRs away. It can only move toward the entry, never away:
+    #: a trail that loosens is just a stop that gets hit later than intended.
+    #:
+    #: Beware the interaction with `stop_loss_atr_multiple`. If the trail is
+    #: TIGHTER than the stop (trail < stop), it supersedes it on the first
+    #: ratchet and the stop never binds. Leave `trailing_activation_atr_multiple`
+    #: at 0 to get that behaviour deliberately; set it higher to defer the trail.
+    trailing_stop_atr_multiple: float = 0.0
+    #: How far price must move in favour before the trail takes over. 0 applies
+    #: it from the first bar, which means a trail tighter than the stop replaces
+    #: it immediately. At 1.0 with a 1.5 ATR trail the stop moves to roughly
+    #: breakeven once the trade is 1.5 ATR in profit and trails from there.
+    trailing_activation_atr_multiple: float = 0.0
     take_profit_enabled: bool = False
     take_profit_pct: float = 6.0
     # Peak-to-trough equity drawdown that halts new entries. Enforced by the

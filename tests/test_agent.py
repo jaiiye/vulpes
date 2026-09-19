@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -723,6 +724,224 @@ safety:
         self.assertIsNone(d.check_macro_filter(sig))
 
 
+class FakeTrendMarket:
+    """A market whose candles produce a chosen ADX and volume profile."""
+
+    def __init__(self, trending: bool = True, last_volume: float = 100.0,
+                 base_volume: float = 100.0, n: int = 120):
+        self.trending = trending
+        self.last_volume = last_volume
+        self.base_volume = base_volume
+        self.n = n
+
+    def candles(self, symbol, interval, lookback):
+        from agent.indicators import CandleSeries
+
+        closes = []
+        price = 100.0
+        for i in range(self.n):
+            # A monotonic ramp is a strong trend; a zigzag is not.
+            step = 1.0 if self.trending else (1.0 if i % 2 == 0 else -1.0)
+            price += step
+            closes.append(price)
+        highs = [c + 0.5 for c in closes]
+        lows = [c - 0.5 for c in closes]
+        opens = [c - 0.2 for c in closes]
+        volumes = [self.base_volume] * self.n
+        volumes[-1] = self.last_volume
+        times = list(range(self.n))
+        return CandleSeries(opens, highs, lows, closes, volumes, times)
+
+
+class TestTrendStrengthGate(unittest.TestCase):
+    """ADX is a regime gate, not a directional one: it stands aside while the
+    market chops. It fails CLOSED when the reading is unavailable, because a
+    gate that lets trades through on missing data stops running without anyone
+    noticing - the failure mode this codebase has hit three times."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        self.tmp.write(
+            """
+name: test
+symbol: BTC
+discipline:
+  min_adx: 20.0
+  btc_trend_filter: false
+  require_smart_money_alignment: false
+indicators:
+  adx_period: 14
+  entry_timeframe: 1h
+  lookback_candles: 300
+risk:
+  stop_loss_enabled: true
+safety:
+  hard_stop_pct: 5.0
+"""
+        )
+        self.tmp.close()
+        self.cfg = load_config(self.tmp.name)
+        self.addCleanup(os.unlink, self.tmp.name)
+
+    def signal(self):
+        from agent.synthesizer import Signal
+
+        return Signal(symbol="BTC", action=LONG, score=70, confidence=0.8)
+
+    def test_a_strong_trend_passes(self):
+        d = Discipline(self.cfg, market=FakeTrendMarket(trending=True))
+        self.assertIsNone(d.check_trend_strength(self.signal()))
+
+    def test_chop_is_blocked(self):
+        d = Discipline(self.cfg, market=FakeTrendMarket(trending=False))
+        reason = d.check_trend_strength(self.signal())
+        self.assertIsNotNone(reason)
+        self.assertIn("ADX", reason)
+
+    def test_missing_candles_block_rather_than_pass(self):
+        d = Discipline(self.cfg, market=FakeMarketForSizing())
+        reason = d.check_trend_strength(self.signal())
+        self.assertIsNotNone(reason)
+        self.assertIn("unavailable", reason)
+
+    def test_a_zero_floor_disables_the_gate(self):
+        self.cfg.discipline.min_adx = 0.0
+        d = Discipline(self.cfg, market=FakeMarketForSizing())
+        self.assertIsNone(d.check_trend_strength(self.signal()))
+
+
+class TestVolumeGate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        self.tmp.write(
+            """
+name: test
+symbol: BTC
+discipline:
+  volume_confirm: true
+  volume_ma_period: 20
+  volume_multiplier: 1.5
+  btc_trend_filter: false
+  require_smart_money_alignment: false
+indicators:
+  entry_timeframe: 1h
+  lookback_candles: 300
+risk:
+  stop_loss_enabled: true
+safety:
+  hard_stop_pct: 5.0
+"""
+        )
+        self.tmp.close()
+        self.cfg = load_config(self.tmp.name)
+        self.addCleanup(os.unlink, self.tmp.name)
+
+    def signal(self):
+        from agent.synthesizer import Signal
+
+        return Signal(symbol="BTC", action=LONG, score=70, confidence=0.8)
+
+    def test_a_volume_spike_passes(self):
+        d = Discipline(self.cfg, market=FakeTrendMarket(last_volume=500.0))
+        self.assertIsNone(d.check_volume(self.signal()))
+
+    def test_a_quiet_bar_is_blocked(self):
+        """The bar must clear 1.5x the average, so an average bar is not enough."""
+        d = Discipline(self.cfg, market=FakeTrendMarket(last_volume=100.0))
+        reason = d.check_volume(self.signal())
+        self.assertIsNotNone(reason)
+        self.assertIn("volume", reason.lower())
+
+    def test_missing_volume_blocks_rather_than_passes(self):
+        d = Discipline(self.cfg, market=FakeMarketForSizing())
+        self.assertIsNotNone(d.check_volume(self.signal()))
+
+    def test_the_gate_is_inert_when_switched_off(self):
+        self.cfg.discipline.volume_confirm = False
+        d = Discipline(self.cfg, market=FakeMarketForSizing())
+        self.assertIsNone(d.check_volume(self.signal()))
+
+
+class TestAtrStopAndTrail(unittest.TestCase):
+    """The stop is volatility-scaled and the trail only ever tightens.
+
+    A trail that loosens is worse than none: it would let a position give back
+    more than the distance it was meant to protect while still looking like
+    protection.
+    """
+
+    def test_trailing_only_moves_toward_entry_for_a_long(self):
+        p = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=90.0,
+            trailing_distance=5.0, best_price=100.0,
+        )
+        # Price runs up: the stop follows.
+        self.assertAlmostEqual(p.ratchet_stop(120.0, 110.0), 115.0)
+        # Price falls back and makes a new low, but never a new high: the stop
+        # must NOT follow it down.
+        self.assertAlmostEqual(p.ratchet_stop(118.0, 80.0), 115.0)
+        self.assertEqual(p.stop_price, 115.0)
+
+    def test_trailing_only_moves_toward_entry_for_a_short(self):
+        p = Position(
+            symbol="BTC", side="short", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=110.0,
+            trailing_distance=5.0, best_price=100.0,
+        )
+        self.assertAlmostEqual(p.ratchet_stop(90.0, 80.0), 85.0)
+        # A bounce must not loosen it.
+        self.assertAlmostEqual(p.ratchet_stop(120.0, 88.0), 85.0)
+        self.assertEqual(p.stop_price, 85.0)
+
+    def test_the_trail_never_widens_the_initial_risk(self):
+        """At entry the trail sits at the same distance as the stop, so the
+        first exit is the stop either way."""
+        p = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=90.0,
+            trailing_distance=5.0, best_price=100.0,
+        )
+        p.ratchet_stop(100.0, 100.0)
+        self.assertEqual(p.stop_price, 95.0)   # tightened, never to 85.0
+
+    def test_no_trail_configured_leaves_the_stop_alone(self):
+        p = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=90.0,
+        )
+        self.assertIsNone(p.ratchet_stop(120.0, 110.0))
+        self.assertEqual(p.stop_price, 90.0)
+
+    def test_the_trail_survives_a_persistence_round_trip(self):
+        """Persisting the stop without the trail's own state looks fine after a
+        restart and silently stops trailing - the position appears protected
+        while the stop stands still for the rest of its life."""
+        p = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=90.0,
+            trailing_distance=5.0, best_price=100.0,
+        )
+        p.ratchet_stop(120.0, 110.0)
+        restored = Position.from_dict(p.to_dict())
+        self.assertAlmostEqual(restored.trailing_distance, 5.0)
+        self.assertAlmostEqual(restored.best_price, 120.0)
+        self.assertAlmostEqual(restored.stop_price, 115.0)
+        # And it keeps ratcheting correctly after the round trip.
+        self.assertAlmostEqual(restored.ratchet_stop(130.0, 125.0), 125.0)
+
+    def test_a_restored_trail_without_a_best_price_seeds_from_entry(self):
+        """Falling back to 0.0 would snap the stop to nonsense on the next tick."""
+        data = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=90.0,
+            trailing_distance=5.0,
+        ).to_dict()
+        data.pop("best_price")
+        restored = Position.from_dict(data)
+        self.assertAlmostEqual(restored.best_price, 100.0)
+
+
 # ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
@@ -731,6 +950,121 @@ safety:
 class FakeMarketForSizing:
     def candles(self, symbol, interval, lookback):
         raise RuntimeError("no candles: exercise the ATR fallback path")
+
+
+class TestAtrStopSizing(unittest.TestCase):
+    """The stop distance can be an ATR multiple instead of a percent of price.
+
+    A fixed percentage is wide on a quiet day and inside the noise on a violent
+    one, and the same instrument is both within a month - so which of the two
+    the sizing path used has to be checkable.
+    """
+
+    def build(self, **risk_overrides):
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        tmp.write(
+            """
+name: test
+symbol: BTC
+risk:
+  stop_loss_enabled: true
+  stop_loss_pct: 3.0
+  account_allocation_pct: 50.0
+  risk_per_trade_pct: 1.0
+  leverage: 2
+safety:
+  hard_stop_pct: 5.0
+"""
+        )
+        tmp.close()
+        self.addCleanup(os.unlink, tmp.name)
+        cfg = load_config(tmp.name)
+        cfg.risk = replace(cfg.risk, **risk_overrides)
+        return cfg
+
+    def sized(self, cfg):
+        # The fallback market has no candles, so compute_size uses
+        # FALLBACK_STOP_FRACTION of price as the ATR estimate - deterministic,
+        # which is what makes the expected distances checkable.
+        from agent.execution import compute_size
+
+        return compute_size(FakeMarketForSizing(), cfg, "BTC", LONG, 100.0, 1000.0)
+
+    def test_an_atr_multiple_overrides_the_percentage(self):
+        pct_only = self.sized(self.build(stop_loss_atr_multiple=0.0))
+        atr_based = self.sized(self.build(stop_loss_atr_multiple=2.0))
+        # Both stop short of entry; the ATR one is placed from ATR, not from 3%.
+        self.assertLess(atr_based.stop_price, 100.0)
+        self.assertNotAlmostEqual(
+            atr_based.stop_price, pct_only.stop_price, places=6
+        )
+
+    def test_a_wider_multiple_places_the_stop_further_away(self):
+        near = self.sized(self.build(stop_loss_atr_multiple=1.0))
+        far = self.sized(self.build(stop_loss_atr_multiple=3.0))
+        self.assertLess(far.stop_price, near.stop_price)
+
+    def test_the_multiple_is_reported_in_the_reasons(self):
+        s = self.sized(self.build(stop_loss_atr_multiple=2.0))
+        self.assertTrue(any("ATR" in n for n in s.notes))
+
+    def test_a_trail_carries_its_distance_and_activation(self):
+        s = self.sized(
+            self.build(
+                stop_loss_atr_multiple=2.0,
+                trailing_stop_atr_multiple=1.5,
+                trailing_activation_atr_multiple=1.5,
+            )
+        )
+        self.assertIsNotNone(s.trailing_distance)
+        self.assertGreater(s.trailing_activation, 0.0)
+
+    def test_no_trail_multiple_leaves_the_distance_none(self):
+        s = self.sized(self.build(stop_loss_atr_multiple=2.0))
+        self.assertIsNone(s.trailing_distance)
+        self.assertEqual(s.trailing_activation, 0.0)
+
+    def test_a_trail_tighter_than_the_stop_supersedes_it_immediately(self):
+        """The defect this option exists for: a 1.5 ATR trail against a 2 ATR
+        stop sits closer to entry, so on the first ratchet it replaces the stop
+        and the 2 ATR stop never binds. Activation defers that."""
+        s = self.sized(
+            self.build(
+                stop_loss_atr_multiple=2.0,
+                trailing_stop_atr_multiple=1.5,
+                trailing_activation_atr_multiple=0.0,
+            )
+        )
+        p = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=s.stop_price,
+            trailing_distance=s.trailing_distance,
+            trailing_activation=s.trailing_activation, best_price=100.0,
+        )
+        # No move yet, and the stop has already tightened: the wider initial
+        # stop is inert.
+        p.ratchet_stop(100.0, 100.0)
+        self.assertNotAlmostEqual(p.stop_price, s.stop_price, places=6)
+
+    def test_activation_keeps_the_initial_stop_until_the_trade_moves(self):
+        s = self.sized(
+            self.build(
+                stop_loss_atr_multiple=2.0,
+                trailing_stop_atr_multiple=1.5,
+                trailing_activation_atr_multiple=1.5,
+            )
+        )
+        p = Position(
+            symbol="BTC", side="long", size=1.0, entry_price=100.0,
+            notional=100.0, leverage=1, stop_price=s.stop_price,
+            trailing_distance=s.trailing_distance,
+            trailing_activation=s.trailing_activation, best_price=100.0,
+        )
+        p.ratchet_stop(100.0, 100.0)
+        self.assertAlmostEqual(p.stop_price, s.stop_price, places=9)
+        # Once the move clears the activation the trail takes over.
+        p.ratchet_stop(100.0 + s.trailing_activation + 1.0, 100.0)
+        self.assertGreater(p.stop_price, s.stop_price)
 
 
 class TestSizing(unittest.TestCase):

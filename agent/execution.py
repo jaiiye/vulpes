@@ -73,6 +73,17 @@ class Position:
     # The risk budget this position was sized against, so PnL can be reported
     # in R multiples.
     risk_usd: float = 0.0
+    #: How far behind the best price the trailing stop sits, fixed at entry.
+    #: None when no trail is configured.
+    trailing_distance: float | None = None
+    #: How far price must move in favour before the trail may replace the
+    #: initial stop, in price units. 0 means from the first bar.
+    trailing_activation: float = 0.0
+    #: Best price seen since entry - highest for a long, lowest for a short.
+    #: 0.0 means "not yet initialised"; it is seeded from `entry_price` on the
+    #: first ratchet so a position opened at an extreme is not immediately
+    #: treated as having given back a move it never made.
+    best_price: float = 0.0
 
     @property
     def signed_size(self) -> float:
@@ -82,6 +93,44 @@ class Position:
         if self.side == "long":
             return (mark_price - self.entry_price) * self.size
         return (self.entry_price - mark_price) * self.size
+
+    def ratchet_stop(self, high: float, low: float) -> float | None:
+        """Move the stop toward entry, behind the best price reached.
+
+        Returns the stop after ratcheting, or None when no trail is configured.
+
+        Only ever moves toward entry. A trail that loosens is worse than no
+        trail at all: it would let a position give back more than the distance
+        it was supposed to protect, while still looking like protection.
+
+        Call this AFTER the bar's stop check, not before. Ratcheting on this
+        bar's high and then testing the result against this bar's low assumes
+        the high came first, and on a down bar it did not - which turns the
+        trail into a same-bar exit at a price the market never offered.
+        """
+        if not self.trailing_distance or self.trailing_distance <= 0:
+            return None
+        if self.best_price <= 0:
+            self.best_price = self.entry_price
+
+        if self.side == "long":
+            self.best_price = max(self.best_price, high)
+            # Defer until the trade has actually moved. Without this the trail
+            # replaces a wider initial stop on the first bar, and the initial
+            # stop never binds at all.
+            if self.best_price - self.entry_price < self.trailing_activation:
+                return self.stop_price
+            candidate = self.best_price - self.trailing_distance
+            if self.stop_price is None or candidate > self.stop_price:
+                self.stop_price = candidate
+        else:
+            self.best_price = min(self.best_price, low)
+            if self.entry_price - self.best_price < self.trailing_activation:
+                return self.stop_price
+            candidate = self.best_price + self.trailing_distance
+            if self.stop_price is None or candidate < self.stop_price:
+                self.stop_price = candidate
+        return self.stop_price
 
     def pnl_pct(self, mark_price: float) -> float:
         if self.entry_price <= 0:
@@ -104,6 +153,12 @@ class Position:
             "entry_score": self.entry_score,
             "entry_reasons": list(self.entry_reasons),
             "is_dry_run": self.is_dry_run,
+            # The trail's own state, not just the stop it has produced so far.
+            # Persisting the stop alone would look fine after a restart and
+            # quietly stop trailing: the position would appear protected while
+            # the stop stood still for the rest of its life.
+            "trailing_distance": self.trailing_distance,
+            "best_price": self.best_price,
         }
 
     @classmethod
@@ -131,6 +186,11 @@ class Position:
 
         stop = data.get("stop_price")
         take = data.get("take_profit_price")
+        trail = data.get("trailing_distance")
+        # A trail with no best price would ratchet from zero on the next tick and
+        # snap the stop to nonsense, so `best_price` falls back to the entry
+        # rather than to 0.0 - the same seeding the open path uses.
+        best = f("best_price") if data.get("best_price") else f("entry_price")
         return cls(
             symbol=symbol.upper(),
             side=side,
@@ -140,6 +200,9 @@ class Position:
             leverage=int(f("leverage", 1)),
             stop_price=None if stop is None else f("stop_price"),
             take_profit_price=None if take is None else f("take_profit_price"),
+            trailing_distance=None if trail is None else f("trailing_distance"),
+            trailing_activation=f("trailing_activation"),
+            best_price=best,
             opened_ts=f("opened_ts"),
             entry_score=f("entry_score"),
             entry_reasons=list(data.get("entry_reasons") or []),
@@ -179,6 +242,14 @@ class SizingResult:
     take_profit_price: float | None
     atr: float
     risk_usd: float
+    #: Distance the trailing stop keeps from the best price reached, in price
+    #: units. None when no trail is configured. Carried rather than recomputed
+    #: per bar because it is fixed at entry: re-deriving it from a later ATR
+    #: would let the trail widen, which is the one thing a trail must not do.
+    trailing_distance: float | None = None
+    #: How far price must move in favour before the trail may take over, in
+    #: price units. Fixed at entry for the same reason as `trailing_distance`.
+    trailing_activation: float = 0.0
     notes: list[str] = field(default_factory=list)
 
 
@@ -241,8 +312,20 @@ def compute_size(
                 "stop distance"
             )
 
-    # Stop distance: explicit stop-loss if enabled, else 1.5 ATR.
-    if r.stop_loss_enabled:
+    # Stop distance, in order of precedence:
+    #   1. an explicit ATR multiple, which scales with volatility
+    #   2. a fixed percentage of price
+    #   3. 1.5 ATR as the risk unit when no protective order is placed at all
+    #
+    # ATR first because a fixed percentage is wide on a quiet day and inside the
+    # noise on a violent one, and the same instrument is both within a month.
+    if r.stop_loss_enabled and r.stop_loss_atr_multiple > 0:
+        stop_distance = atr_value * r.stop_loss_atr_multiple
+        notes.append(
+            f"stop is {r.stop_loss_atr_multiple:g} x ATR(14) = {stop_distance:.4g} "
+            f"({stop_distance / price:.2%} of price)"
+        )
+    elif r.stop_loss_enabled:
         stop_distance = price * r.stop_loss_pct / 100.0
     else:
         stop_distance = atr_value * 1.5
@@ -306,8 +389,33 @@ def compute_size(
 
     stop_price = None
     take_profit_price = None
+    trailing_distance = None
+    trailing_activation = 0.0
     if r.stop_loss_enabled:
         stop_price = price - stop_distance if side == LONG else price + stop_distance
+        # NOTE on the two multiples: the trail does NOT start where the stop is
+        # unless the two multiples are equal. A 1.5 ATR trail against a 2 ATR
+        # stop sits CLOSER to entry, so it takes over on the first ratchet and
+        # the 2 ATR stop never binds at all - the effective stop becomes 1.5
+        # ATR from entry, tightening on every new high. Measured on 170 days x
+        # 3 markets: 326 of 328 exits became stop-outs, the trade count tripled
+        # (the single position slot frees on every exit), and profit factor fell
+        # from 1.21 to 0.86. Set `trailing_activation_atr_multiple` to keep the
+        # initial stop until the trade has actually moved.
+        if r.trailing_stop_atr_multiple > 0:
+            trailing_distance = atr_value * r.trailing_stop_atr_multiple
+            activation = r.trailing_activation_atr_multiple
+            trailing_activation = atr_value * activation
+            notes.append(
+                f"trailing stop {r.trailing_stop_atr_multiple:g} x ATR(14) = "
+                f"{trailing_distance:.4g}, ratcheting toward entry only"
+                + (
+                    f"; inactive until price moves {activation:g} x ATR in "
+                    "favour, so the initial stop holds until then"
+                    if activation > 0
+                    else "; active from the first bar"
+                )
+            )
     if r.take_profit_enabled:
         tp_distance = price * r.take_profit_pct / 100.0
         take_profit_price = price + tp_distance if side == LONG else price - tp_distance
@@ -328,6 +436,8 @@ def compute_size(
         take_profit_price=take_profit_price,
         atr=atr_value,
         risk_usd=risk_usd,
+        trailing_distance=trailing_distance,
+        trailing_activation=trailing_activation,
         notes=notes,
     )
 
@@ -450,6 +560,8 @@ class Broker:
         take_profit_price: float | None = None,
         entry_score: float = 0.0,
         entry_reasons: list[str] | None = None,
+        trailing_distance: float | None = None,
+        trailing_activation: float = 0.0,
     ) -> Position:
         """Open a position, reducing any opposite exposure first."""
         size = self._round_size(symbol, size)
@@ -584,6 +696,11 @@ class Broker:
             entry_score=entry_score,
             entry_reasons=list(entry_reasons or []),
             is_dry_run=self.dry_run,
+            trailing_distance=trailing_distance,
+            trailing_activation=trailing_activation,
+            # Seeded from the fill so the first ratchet measures the move from
+            # where we actually got in, not from zero.
+            best_price=price,
         )
 
     # ------------------------------------------------------------------

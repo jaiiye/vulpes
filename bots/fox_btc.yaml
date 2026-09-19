@@ -30,8 +30,8 @@ indicators:
   supertrend_multiplier: 3.0
   rsi_period: 14
   adx_period: 14
-  ema_fast: 21
-  ema_slow: 55
+  ema_fast: 20
+  ema_slow: 50
   atr_period: 14
   lookback_candles: 300
 
@@ -53,6 +53,16 @@ discipline:
   btc_trend_filter: true                # no dip-buying while BTC 4h is down
   btc_trend_timeframe: 4h
   min_score_gap: 3.0          # ignore signals that barely cross a threshold
+  # Trend-strength floor. ADX carries no direction, so this is a regime gate:
+  # it stands aside when the market is chopping, which is where an EMA/RSI read
+  # is least meaningful. 0 disables.
+  min_adx: 20.0
+  # Volume confirmation: the entry bar's volume must exceed its own 20-bar
+  # average. Volume is the only input in this strategy not derived from price,
+  # so it is the only one that can corroborate a move rather than restate it.
+  volume_confirm: true
+  volume_ma_period: 20
+  volume_multiplier: 1.0
 
 # Overall confidence floor. Below this, too many inputs are missing.
 min_confidence: 0.35
@@ -68,7 +78,35 @@ risk:
   risk_per_trade_pct: 1.0        # risk budget per trade
   max_position_usd: 0            # 0 = derive from equity
   stop_loss_enabled: true
-  stop_loss_pct: 3.0
+  stop_loss_pct: 3.0             # ignored while stop_loss_atr_multiple > 0
+  # Volatility-scaled stop: 2 ATR(14) from entry. A fixed 3% is wide on a quiet
+  # day and inside the noise on a violent one, and BTC is both within a month.
+  stop_loss_atr_multiple: 2.0
+  # Trailing stop. DISABLED, because it was measured and it loses.
+  #
+  # The request was a 1.5 ATR trail behind the best price. Implemented and
+  # measured over 170 days x 3 markets, every variant was worse than no trail:
+  #
+  #   no trail              130 trades   PF 1.32   +5.30%   stop:95  take:23
+  #   trail 1.5, active now 328 trades   PF 0.86   -2.81%   stop:326 take:1
+  #   trail 1.5, act 0.5A   315 trades   PF 0.92   -1.59%   stop:313 take:1
+  #   trail 1.5, act 1.5A   288 trades   PF 0.80   -4.86%   stop:286 take:1
+  #   trail 3.0 (wider)     199 trades   PF 1.02   +0.48%   stop:187 take:11
+  #
+  # The mechanism is in the `take` column: the trail exits at ~1.5 ATR, so the
+  # 9% target is essentially never reached (23 take-profits collapse to 1). And
+  # because only one position may be open at a time, every trail exit frees the
+  # slot for a new entry - the trade count more than doubles, which is the one
+  # variable this project's own evidence says dominates outcomes.
+  #
+  # The interaction that makes it worse than it looks: a 1.5 ATR trail is
+  # TIGHTER than the 2 ATR stop, so it supersedes the stop on the first bar and
+  # the 2 ATR stop never binds at all. Set `trailing_activation_atr_multiple` to
+  # defer it if the trail is ever re-enabled.
+  #
+  # Set this above 0 to turn it back on; the sweep above is the reason not to.
+  trailing_stop_atr_multiple: 0.0
+  trailing_activation_atr_multiple: 1.5
   take_profit_enabled: true
   take_profit_pct: 9.0           # 3:1 reward:risk, matching Fox's asymmetry
   # Peak-to-trough equity drawdown that HALTS new entries. The halt is
