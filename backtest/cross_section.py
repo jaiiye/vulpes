@@ -620,3 +620,27 @@ def restrict(panel: Panel, symbols: set[str]) -> Panel:
         close={s: list(panel.close[s]) for s in keep},
         volume={s: list(panel.volume[s]) for s in keep} if panel.volume else {},
     )
+
+
+def slice_rows(panel: Panel, start: int, end: int) -> Panel:
+    """Rows [start, end), keeping every symbol.
+
+    Slicing the rows rather than the symbols is what makes a stability study
+    possible: the same universe definition applied to disjoint stretches of time
+    tells you whether a result is a property of the signal or of the one period
+    it was measured on.
+    """
+    if start < 0 or end > len(panel) or start >= end:
+        raise CrossSectionError(
+            f"bad row range [{start}, {end}) for a panel of {len(panel)} rows"
+        )
+    return Panel(
+        times=list(panel.times[start:end]),
+        symbols=list(panel.symbols),
+        close={s: list(panel.close[s][start:end]) for s in panel.symbols},
+        volume=(
+            {s: list(panel.volume[s][start:end]) for s in panel.symbols}
+            if panel.volume
+            else {}
+        ),
+    )

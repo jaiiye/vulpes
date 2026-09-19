@@ -27,6 +27,7 @@ from backtest.cross_section import (
     random_signal,
     realized_vol,
     restrict,
+    slice_rows,
 )
 
 
@@ -396,6 +397,56 @@ class TestLiquidSplit(unittest.TestCase):
         p = make_panel(5, {"S0": ramp(1.0, 1.0, 5)})
         with self.assertRaises(CrossSectionError):
             restrict(p, {"nope"})
+
+
+class TestSliceRows(unittest.TestCase):
+    """Slicing time is what makes a stability study possible, so the slice has
+    to be exact: an off-by-one here silently shifts every segment."""
+
+    def build(self):
+        return make_panel(
+            10, {"A": ramp(0.0, 1.0, 10), "B": ramp(100.0, -1.0, 10)}
+        )
+
+    def test_slice_keeps_the_requested_rows(self):
+        p = self.build()
+        s = slice_rows(p, 2, 5)
+        self.assertEqual(len(s), 3)
+        self.assertEqual(s.times, p.times[2:5])
+        self.assertEqual(s.close["A"], [2.0, 3.0, 4.0])
+        self.assertEqual(s.close["B"], [98.0, 97.0, 96.0])
+
+    def test_slice_keeps_every_symbol(self):
+        """Symbols are dropped by `restrict`, not by the time slice; mixing the
+        two would make it impossible to tell a universe change from a period
+        change."""
+        p = self.build()
+        self.assertEqual(slice_rows(p, 0, 4).symbols, p.symbols)
+
+    def test_slice_preserves_missing_bars(self):
+        p = make_panel(6, {"A": [1.0, None, 3.0, 4.0, None, 6.0]})
+        self.assertEqual(slice_rows(p, 1, 5).close["A"], [None, 3.0, 4.0, None])
+
+    def test_the_whole_range_is_the_same_panel(self):
+        p = self.build()
+        s = slice_rows(p, 0, len(p))
+        self.assertEqual(s.times, p.times)
+        self.assertEqual(s.close, p.close)
+
+    def test_empty_and_out_of_range_slices_are_rejected(self):
+        p = self.build()
+        for start, end in ((3, 3), (5, 4), (-1, 3), (0, 11)):
+            with self.subTest(start=start, end=end):
+                with self.assertRaises(CrossSectionError):
+                    slice_rows(p, start, end)
+
+    def test_slices_do_not_share_storage(self):
+        """A slice that aliased the parent's lists would let a signal mutate the
+        full panel, and every later segment would see the change."""
+        p = self.build()
+        s = slice_rows(p, 0, 4)
+        s.close["A"][0] = 999.0
+        self.assertEqual(p.close["A"][0], 0.0)
 
 
 class TestCrossSectionParity(unittest.TestCase):
