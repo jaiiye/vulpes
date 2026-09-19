@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import json
 import math
+from dataclasses import replace  # noqa: E402
 import os
 import shutil
 import sys
@@ -1733,6 +1734,56 @@ class TestArchiveCandleLoader(unittest.TestCase):
             )
             compared += 1
         self.assertEqual(compared, 3)
+
+
+class TestMacroFilterSilentlyOff(unittest.TestCase):
+    """A run without BTC loaded loses the macro filter, silently.
+
+    The filter asks the market for BTC bars whichever market is being traded,
+    and `safe_candles` swallows the lookup failure. So the gate simply stops
+    running: no exception, no zero-division, just a rejection count with no
+    `macro filter` rows. Measured on a 170-day window, ETH saw 0 blocks instead
+    of 101 and SOL 0 instead of 218, and SOL's return went from -0.23% to
+    +1.88% depending only on whether BTC was in the dict.
+
+    `run_backtest.py` loads BTC alongside any market for this reason, so the CLI
+    is safe. This guards every other caller - the benchmarks module, a sweep
+    script, anything assembling `datasets` by hand.
+    """
+
+    def setUp(self):
+        self.cfg_path = write_config(CONFIG)
+        self.addCleanup(os.unlink, self.cfg_path)
+        self.cfg = load_config(self.cfg_path)
+
+    def warnings(self, datasets):
+        # Trading ETH, so the engine's own lookup of the traded market succeeds
+        # and only the BTC lookup - the one the macro filter makes - is missing.
+        bt = Backtester(replace(self.cfg, symbol="ETH"), datasets)
+        return " ".join(bt.warnings)
+
+    def dataset(self):
+        return make_dataset([100.0 + 10 * math.sin(i / 12.0) for i in range(400)])
+
+    def test_missing_btc_is_reported(self):
+        text = self.warnings({"ETH": self.dataset()})
+        self.assertIn("macro filter", text)
+        self.assertIn("BTC was not loaded", text)
+
+    def test_btc_present_stays_quiet(self):
+        text = self.warnings(
+            {"ETH": self.dataset(), "BTC": self.dataset()}
+        )
+        self.assertNotIn("macro filter", text)
+
+    def test_the_lowercase_key_also_counts_as_loaded(self):
+        """The check is on uppercase keys because `BacktestMarket` uppercases
+        them when it stores the dict. A lowercase 'btc' that the market looks up
+        successfully must not still warn."""
+        text = self.warnings(
+            {"ETH": self.dataset(), "btc": self.dataset()}
+        )
+        self.assertNotIn("BTC was not loaded", text)
 
 
 class TestEntryTimeframeOverride(unittest.TestCase):

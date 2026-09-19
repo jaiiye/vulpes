@@ -160,6 +160,29 @@ class Backtester:
         # Initialised before anything can append to them.
         self.warnings: list[str] = []
 
+        # The macro filter asks the market for BTC bars, whichever market is
+        # being traded, and `safe_candles` swallows the lookup failure. So a run
+        # whose datasets omit BTC loses the gate entirely and silently: the
+        # filter blocks nothing, the rejection counts show no `macro filter`
+        # rows, and the equity curve just looks different.
+        #
+        # Measured on a 170-day window: ETH saw 0 blocks instead of 101 and SOL
+        # 0 instead of 218, and SOL's return went from -0.23% to +1.88% depending
+        # only on whether BTC happened to be in the dict. The CLI loads BTC
+        # alongside any market for exactly this reason; this warning is for
+        # every other caller.
+        if (
+            config.discipline.btc_trend_filter
+            and "BTC" not in {k.upper() for k in datasets}
+        ):
+            self.warnings.append(
+                "BTC was not loaded, so the macro filter that blocks "
+                "counter-trend entries against the BTC "
+                f"{config.discipline.btc_trend_timeframe} Supertrend could not "
+                "read it and did not run. Load BTC alongside the traded market "
+                "or the gate is off."
+            )
+
         # The live pipeline, unmodified.
         self.synth = Synthesizer(config, self.market)
         self.smart_money_source = None
