@@ -144,6 +144,18 @@ execution:
   limit_offset_bps: 5.0
   slippage_bps: 20.0
   max_spread_bps: 25.0
+  # Cost charged per leg on SIMULATED fills only (dry runs), so a paper record
+  # carries a net figure instead of a gross one. Real fills are not charged it:
+  # the venue charges its own and the raw order result records it.
+  #
+  # 7.2 is the measured real cost per leg at $1k size on BTC - 3.5bp taker fee
+  # plus execution (RESEARCH.md §二.19) - and it is the conservative choice
+  # here on purpose. The line above intends maker fills (~1bp of fee), but
+  # maker fills are UNMEASURED and their real hazard is adverse selection
+  # (filling only when price keeps going against you), which this record does
+  # not model at all. Measuring better costs the wrong way round: 14.9bp/leg at
+  # $10k, so scale it with the size you intend to trade.
+  fee_bps: 7.2
   poll_interval_seconds: 300   # 5 minutes; this is not a scalping bot
   dry_run: true                # overridden to false only via --live flags
   testnet: true                # mainnet requires an explicit change

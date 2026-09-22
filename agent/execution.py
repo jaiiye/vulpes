@@ -91,6 +91,13 @@ class Position:
     # The risk budget this position was sized against, so PnL can be reported
     # in R multiples.
     risk_usd: float = 0.0
+    #: Cost charged on the ENTRY leg of a simulated fill, in USD. Carried
+    #: rather than recomputed at exit for the same reason as
+    #: `trailing_distance`: the rate in force when the position was opened is
+    #: the one the exit has to pair with, and re-deriving it from a config read
+    #: later would silently re-price a trade that is already open. Stays 0.0 on
+    #: a real fill, where the venue's own fee is the truth.
+    entry_fee_usd: float = 0.0
     #: How far behind the best price the trailing stop sits, fixed at entry.
     #: None when no trail is configured.
     trailing_distance: float | None = None
@@ -164,6 +171,10 @@ class Position:
             "size": self.size,
             "entry_price": self.entry_price,
             "notional": self.notional,
+            # Persisted, not recomputed: see the field's own note. Without this
+            # an open simulated position would come back from a restart with 0
+            # and its exit would report a round trip that was charged one leg.
+            "entry_fee_usd": self.entry_fee_usd,
             "leverage": self.leverage,
             "stop_price": self.stop_price,
             "take_profit_price": self.take_profit_price,
@@ -226,6 +237,10 @@ class Position:
             entry_reasons=list(data.get("entry_reasons") or []),
             is_dry_run=bool(data.get("is_dry_run", True)),
             risk_usd=f("risk_usd"),
+            # 0.0 for a state file written before this field existed, which is
+            # the honest reading: that entry was never charged a simulated fee,
+            # so its exit must not pretend one was collected.
+            entry_fee_usd=f("entry_fee_usd"),
         )
 
 
@@ -700,6 +715,19 @@ class Broker:
                 return float(balance.get("total", 0) or 0)
         return 0.0
 
+    def _simulated_fee(self, notional: float) -> float:
+        """Cost to charge on one leg of a simulated fill.
+
+        Per leg, on that leg's OWN notional: the two legs are not the same size.
+        A position that ran from 78,044.5 to 85,144.5 pays the fee on $99.98 and
+        on $109.07, not twice on the entry - which is also why this cannot be
+        folded into a single round-trip number at entry time.
+
+        Called only on the simulated path. A real fill is not charged here: the
+        venue charges the real fee, and the raw order result is what records it.
+        """
+        return notional * self.cfg.execution.fee_bps / 10_000.0
+
     def _reject_small_order(self, symbol: str, size: float, order_price: float) -> None:
         """Refuse to send an entry the venue would refuse for being too small.
 
@@ -782,7 +810,12 @@ class Broker:
             symbol, size, price * (1 + offset) if is_buy else price * (1 - offset)
         )
 
+        #: The simulated entry's cost. Stays 0.0 on a real fill, where the venue
+        #: charges its own fee and the raw order result records it.
+        entry_fee = 0.0
+
         if self.dry_run:
+            entry_fee = self._simulated_fee(notional)
             self.journal.event(
                 "order_simulated",
                 symbol=symbol,
@@ -793,7 +826,14 @@ class Broker:
                 leverage=leverage,
                 stop_price=stop_price,
                 take_profit_price=take_profit_price,
-                note="dry_run active: no order was sent",
+                fee_bps=self.cfg.execution.fee_bps,
+                fee_usd=round(entry_fee, 4),
+                note=(
+                    "dry_run active: no order was sent. fee_usd is the "
+                    "configured estimate (execution.fee_bps), not a venue "
+                    "charge, and it is recorded rather than deducted - "
+                    "realised_pnl stays gross, by decision"
+                ),
             )
         else:
             # `_ensure_sdk` already ran, above the rounding: it is idempotent.
@@ -911,6 +951,7 @@ class Broker:
             entry_score=entry_score,
             entry_reasons=list(entry_reasons or []),
             is_dry_run=self.dry_run,
+            entry_fee_usd=entry_fee,
             trailing_distance=trailing_distance,
             trailing_activation=trailing_activation,
             # Seeded from the fill so the first ratchet measures the move from
@@ -1323,10 +1364,20 @@ class Broker:
         filled. The caller is told the truth about whether the position is
         gone, and a refused close is precisely the case it must not mistake for
         one - see `_market_close_confirmed` for what that mistake cost.
+
+        The returned figure is GROSS of simulated fees, and deliberately so:
+        the run stats and `discipline.record_outcome` read this value, and
+        moving them to net would change when the guardrails trip on an unchanged
+        trade sequence. The net figure is recorded in the journal instead, where
+        it can be read without changing anything that acts on it.
         """
         pnl = position.unrealized_pnl(price)
 
         if position.is_dry_run or self.dry_run:
+            # Both legs, each on its own notional. The entry leg was charged
+            # when the position was opened and carried here (see
+            # `Position.entry_fee_usd`); the exit leg is charged now.
+            exit_fee = self._simulated_fee(position.size * price)
             self.journal.event(
                 "close_simulated",
                 symbol=position.symbol,
@@ -1335,8 +1386,16 @@ class Broker:
                 entry_price=position.entry_price,
                 exit_price=price,
                 pnl=round(pnl, 4),
+                fee_bps=self.cfg.execution.fee_bps,
+                fee_usd=round(exit_fee, 4),
+                entry_fee_usd=round(position.entry_fee_usd, 4),
+                pnl_net=round(pnl - position.entry_fee_usd - exit_fee, 4),
                 reason=reason,
-                note="dry_run active: no order was sent",
+                note=(
+                    "dry_run active: no order was sent. fee_usd is the exit "
+                    "leg's configured estimate, entry_fee_usd the entry leg's; "
+                    "pnl_net = pnl - both"
+                ),
             )
         else:
             self._ensure_sdk()

@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.config import load_config  # noqa: E402
+from agent.config import ConfigError, load_config  # noqa: E402
 from agent.execution import (  # noqa: E402
     Broker,
     CriticalExecutionError,
@@ -1231,6 +1231,132 @@ class TestSizeIsRoundedWithTheVenueDecimals(ExecutionValueTestCase):
         broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
 
         self.assertIn("order_simulated", self.journal_text())
+
+
+class TestSimulatedFees(ExecutionValueTestCase):
+    """A simulated fill carries a cost, and only a simulated one.
+
+    The paper record used to be gross, and the open question of this project is
+    whether the edge survives the cost - so the record was structurally unable
+    to answer it, in the optimistic direction. The fee is RECORDED, not
+    deducted: `realised_pnl` and `discipline.record_outcome` still read the
+    gross figure, which is a separate decision with its own consequences.
+    """
+
+    def dry_broker(self, config=None):
+        broker = Broker(config or self.cfg, None, self.journal)
+        self.assertTrue(broker.dry_run, "these tests are about the dry path")
+        broker._sz_decimals["BTC"] = 5
+        return broker
+
+    def event(self, kind):
+        return next(e for e in self.events() if e.get("kind") == kind)
+
+    def test_a_simulated_entry_is_charged_the_configured_fee(self):
+        broker = self.dry_broker()
+
+        broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        entry = self.event("order_simulated")
+        self.assertAlmostEqual(entry["notional"], 10.44, places=2)
+        self.assertEqual(entry["fee_bps"], self.cfg.execution.fee_bps)
+        self.assertAlmostEqual(entry["fee_usd"], 10.44 * 7.2 / 10_000.0, places=4)
+
+    def test_the_two_legs_are_charged_on_their_own_notional(self):
+        """Not twice the entry. A position that moved pays the fee on two
+        different notionals, which is also why the round trip cannot be priced
+        once at entry."""
+        broker = self.dry_broker()
+        position = broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        broker.close_position(position, 95_000.0, "test")
+
+        closed = self.event("close_simulated")
+        self.assertAlmostEqual(
+            closed["entry_fee_usd"], 0.00012 * 87_000.0 * 7.2e-4, places=4
+        )
+        self.assertAlmostEqual(
+            closed["fee_usd"], 0.00012 * 95_000.0 * 7.2e-4, places=4
+        )
+        self.assertGreater(
+            closed["fee_usd"],
+            closed["entry_fee_usd"],
+            "the exit notional is larger, so its fee is too",
+        )
+
+    def test_the_net_figure_is_recorded_and_the_return_stays_gross(self):
+        """The asymmetry is the point of this change: the journal can be read
+        net, and nothing that ACTS on the number moved."""
+        broker = self.dry_broker()
+        position = broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        returned = broker.close_position(position, 95_000.0, "test")
+
+        closed = self.event("close_simulated")
+        gross = (95_000.0 - 87_000.0) * 0.00012
+        self.assertAlmostEqual(returned, gross, places=6)
+        self.assertAlmostEqual(closed["pnl"], gross, places=4)
+        self.assertAlmostEqual(
+            closed["pnl_net"],
+            gross - closed["entry_fee_usd"] - closed["fee_usd"],
+            places=4,
+        )
+        self.assertLess(closed["pnl_net"], closed["pnl"])
+
+    def test_a_real_fill_is_not_charged_a_simulated_fee(self):
+        """The venue charges its own there and the raw result carries it, so an
+        estimate on top would be a second, invented charge."""
+        ex = FakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex)
+
+        position = broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        self.assertEqual(position.entry_fee_usd, 0.0)
+        self.assertNotIn("fee_usd", self.event("order_submitted"))
+
+    def test_a_zero_fee_leaves_the_net_equal_to_the_gross(self):
+        """The whole thing has to be switchable off."""
+        cfg = load_config(
+            self._write(CONFIG.replace("  dry_run: true", "  fee_bps: 0\n  dry_run: true"))
+        )
+        broker = self.dry_broker(cfg)
+        position = broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        broker.close_position(position, 95_000.0, "test")
+
+        closed = self.event("close_simulated")
+        self.assertEqual(closed["fee_usd"], 0.0)
+        self.assertEqual(closed["entry_fee_usd"], 0.0)
+        self.assertEqual(closed["pnl_net"], closed["pnl"])
+
+    def test_a_negative_fee_is_refused(self):
+        """It would credit the paper record, which is the one direction this
+        field must never move."""
+        with self.assertRaises(ConfigError):
+            load_config(
+                self._write(
+                    CONFIG.replace("  dry_run: true", "  fee_bps: -1.0\n  dry_run: true")
+                )
+            )
+
+    def test_the_entry_fee_survives_a_state_round_trip(self):
+        """A restart must not turn a charged entry into a free one - and the
+        exit reads this value off the position, not off the config."""
+        broker = self.dry_broker()
+
+        position = broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+        restored = Position.from_dict(position.to_dict())
+
+        self.assertGreater(restored.entry_fee_usd, 0.0)
+        self.assertAlmostEqual(restored.entry_fee_usd, position.entry_fee_usd, places=6)
+
+    def test_a_state_file_from_before_this_field_charges_nothing(self):
+        """Honest degradation: that entry was never charged, so its exit must
+        not report a fee it did not collect."""
+        data = self.position().to_dict()
+        data.pop("entry_fee_usd")
+
+        self.assertEqual(Position.from_dict(data).entry_fee_usd, 0.0)
 
 
 if __name__ == "__main__":

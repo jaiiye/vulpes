@@ -172,6 +172,20 @@ class Execution:
     slippage_bps: float = 20.0
     max_spread_bps: float = 25.0
     poll_interval_seconds: int = 60
+    #: Cost charged per leg on a *simulated* fill, in basis points of that leg's
+    #: notional. It exists because a paper record with no cost in it reports the
+    #: gross result, and the whole question this project is stuck on is whether
+    #: the edge survives the cost.
+    #:
+    #: Default is the measured real cost at $1k size on BTC: 3.5 bp taker fee
+    #: plus execution, `7.2 bp/leg` (RESEARCH.md §二.19), against a break-even
+    #: of 2.5-5.5 bp/leg for the rules that were measured. It is size-dependent
+    #: - the same measurement gave 14.9 bp/leg at $10k - so set it to the cost
+    #: you actually intend to pay rather than trusting the default.
+    #:
+    #: Charged only where the venue does not charge it: a simulated fill has no
+    #: venue fee, a real one does. See `Broker.close_position`.
+    fee_bps: float = 7.2
     dry_run: bool = True
     testnet: bool = True
     base_url: str | None = None
@@ -492,6 +506,10 @@ def _validate(cfg: BotConfig, risk_preset: str | None) -> None:
         raise ConfigError("execution.order_type must be 'limit' or 'market'")
     if e.poll_interval_seconds < 5:
         raise ConfigError("execution.poll_interval_seconds must be >= 5")
+    # A negative fee would credit the paper record instead of charging it,
+    # which is the one direction this field must never move.
+    if e.fee_bps < 0:
+        raise ConfigError("execution.fee_bps must be >= 0")
 
     # Live trading requires an explicit key and is mainnet-gated below.
     if not e.dry_run and not os.getenv("HYPERLIQUID_PRIVATE_KEY"):
