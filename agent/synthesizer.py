@@ -23,7 +23,7 @@ from .factors.base import FactorScore
 from .factors.market_factor import MarketFactor
 from .factors.smart_money import SmartMoneySnapshot, smart_money_factor_from_config
 from .factors.technical import TechnicalFactor
-from .market_data import HyperliquidMarket
+from .market_data import HyperliquidMarket, mainnet_data_market
 
 LONG = "long"
 SHORT = "short"
@@ -60,14 +60,27 @@ class Signal:
 class Synthesizer:
     """Combines factor scores into discrete signals."""
 
-    def __init__(self, config: BotConfig, market: HyperliquidMarket | None = None) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        market: HyperliquidMarket | None = None,
+        data_market: HyperliquidMarket | None = None,
+    ) -> None:
         self.cfg = config
+        #: Where orders go. Kept because callers and tests reach for it, but
+        #: nothing in this class reads data from it any more.
         self.market = market or HyperliquidMarket(
             testnet=config.execution.testnet, base_url=config.execution.base_url
         )
-        self.smart_money = smart_money_factor_from_config(config, self.market)
-        self.technical = TechnicalFactor(self.market, config.indicators)
-        self.market_factor = MarketFactor(self.market)
+        #: Where the factors read. Always mainnet - see `mainnet_data_market`.
+        #: All THREE factors go through this, not just the whale one: leaving
+        #: the other two on the execution client meant `testnet: true` scored
+        #: them on testnet funding and candles, so a testnet run rehearsed a
+        #: different strategy than the one mainnet would run.
+        self.data_market = data_market or mainnet_data_market(self.market)
+        self.smart_money = smart_money_factor_from_config(config, self.data_market)
+        self.technical = TechnicalFactor(self.data_market, config.indicators)
+        self.market_factor = MarketFactor(self.data_market)
 
     # ------------------------------------------------------------------
     def compute_factors(self, symbol: str) -> dict[str, FactorScore]:

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from ..config import BotConfig
 from ..http_util import HttpError, request_json
-from ..market_data import HyperliquidMarket, MarketDataError
+from ..market_data import HyperliquidMarket, MarketDataError, mainnet_data_market
 from .base import FactorScore
 
 MAX_SNAPSHOT_AGE_SECONDS = 900  # 15 minutes
@@ -1261,10 +1261,10 @@ class SmartMoneyFactor:
         self.market = market
         self.use_hyperfeed = use_hyperfeed
         # Reuse the caller's client when it is already mainnet, so tests and
-        # mainnet runs do not open a redundant client.
-        self.data_market = data_market or (
-            market if not market.testnet else HyperliquidMarket(testnet=False)
-        )
+        # mainnet runs do not open a redundant client. The rule lives in
+        # `market_data.mainnet_data_market` because the other two factors broke
+        # it while it was written out by hand here - see that function.
+        self.data_market = data_market or mainnet_data_market(market)
         self.leaderboard = LeaderboardWalletSource(
             self.data_market,
             cache_path=cache_path,

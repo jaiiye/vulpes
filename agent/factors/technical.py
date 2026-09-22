@@ -29,6 +29,17 @@ class TechnicalFactor:
         self.cfg = indicators_cfg
 
     def evaluate(self, symbol: str) -> FactorScore:
+        #: Which venue the candles come from. Signals must read mainnet whatever
+        #: `execution.testnet` says; recorded so a violation shows up in the
+        #: journal instead of staying silent.
+        #:
+        #: Computed before any early return on purpose. "Insufficient history"
+        #: and "no candles at all" are the two cases where someone actually
+        #: asks which venue was read - and they were the two that recorded
+        #: nothing, because every early return skipped the `details` dict that
+        #: was built further down.
+        data_network = "testnet" if getattr(self.market, "testnet", False) else "mainnet"
+
         entry = safe_candles(
             self.market,
             symbol,
@@ -44,6 +55,7 @@ class TechnicalFactor:
                     f"insufficient {self.cfg.entry_timeframe} candle history "
                     f"({0 if entry is None else len(entry)} bars)"
                 ],
+                details={"data_network": data_network},
             )
 
         trend = safe_candles(
@@ -52,7 +64,7 @@ class TechnicalFactor:
 
         components: list[tuple[str, float, float]] = []  # (label, score, weight)
         reasons: list[str] = []
-        details: dict[str, object] = {}
+        details: dict[str, object] = {"data_network": data_network}
 
         # --- Supertrend (entry timeframe) ------------------------------
         st_line, st_dir = entry.supertrend(

@@ -351,3 +351,31 @@ def safe_candles(
         return None
     except Exception:  # noqa: BLE001 - defensive: caller falls back to a default
         return None
+
+
+def mainnet_data_market(
+    market: HyperliquidMarket | None = None,
+) -> HyperliquidMarket:
+    """The client that signal-side code must read, given an execution client.
+
+    **Signals always read mainnet.** `execution.testnet` chooses where *orders*
+    go, never what the signal sees. Stated as a rule, this already existed for
+    the whale factor - reading the leaderboard's mainnet addresses through the
+    testnet API returned empty positions for all 25 sampled wallets, silently
+    zeroing the heaviest weight in the blend.
+
+    The other two factors did NOT follow it, and nothing caught that until it
+    was measured. With `testnet: true` the `market` factor scored on testnet
+    funding - 8.12 bp/h (711% APR) against 0.30 bp/h (26% APR) on mainnet -
+    which moved its score from 37.0 to 51.9 and the blended confidence from
+    58% to 85%. A testnet run was therefore not rehearsing the mainnet
+    strategy; it was rehearsing a different one, on 60% of the factor weight.
+
+    Returning `market` itself when it is already mainnet matters: mainnet runs
+    and the backtest (whose market reports `testnet = False`) must not open a
+    second client. Passing `None` yields a mainnet client for callers that have
+    no execution client at all, such as the snapshot recorder.
+    """
+    if market is not None and not getattr(market, "testnet", False):
+        return market
+    return HyperliquidMarket(testnet=False)

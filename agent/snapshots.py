@@ -27,7 +27,7 @@ from .factors.smart_money import (
     SmartMoneySnapshot,
     smart_money_factor_from_config,
 )
-from .market_data import HyperliquidMarket
+from .market_data import HyperliquidMarket, mainnet_data_market
 
 DEFAULT_SNAPSHOT_PATH = "snapshots/whale_positions.jsonl"
 DEFAULT_SYMBOLS = ("BTC", "ETH")
@@ -101,8 +101,9 @@ class SnapshotRecorder:
         config: BotConfig | None = None,
     ) -> None:
         self.path = Path(path) if path else None
-        # Whale data is mainnet-only, same rule as the live factor.
-        self.market = market or HyperliquidMarket(testnet=False)
+        # Whale data is mainnet-only, same rule as the live factor - and now
+        # the same *code*, so the two cannot drift apart.
+        self.market = mainnet_data_market(market)
 
         # The recorder must select wallets exactly as the agent does, or the
         # recorded history describes a different strategy than the one being

@@ -64,7 +64,11 @@ class MarketFactor:
         details["open_interest_base"] = round(ctx.open_interest, 4)
         details["open_interest_usd"] = round(oi_notional, 2)
         details["day_change_pct"] = round(ctx.day_change_pct, 2)
-        details["testnet"] = self.market.testnet
+        # Same key and same vocabulary as the other two factors. Two names for
+        # one concept is how a reader ends up comparing them wrongly - and the
+        # whole point of recording this is that a factor reading the wrong venue
+        # is otherwise invisible in the journal.
+        details["data_network"] = "testnet" if self.market.testnet else "mainnet"
 
         # --- Crowding read (contrarian) --------------------------------
         # Positive funding = longs pay = longs crowded = lean short.

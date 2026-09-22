@@ -1826,6 +1826,180 @@ class TestSmartMoneyDataNetwork(unittest.TestCase):
         self.assertEqual(score.details["data_network"], "mainnet")
 
 
+class TestSignalsAlwaysReadMainnet(unittest.TestCase):
+    """`execution.testnet` routes orders; it must not change what the signal reads.
+
+    The whale factor followed that rule from the start. The other two did not,
+    and nothing noticed until it was measured: with `testnet: true` their scores
+    came from testnet data, which is 60% of the blend by weight. Testnet BTC
+    funding read 8.12 bp/h (711% APR) against 0.30 bp/h (26%) on mainnet, moving
+    the `market` factor from 37.0 to 51.9 and the blended confidence from 58% to
+    85%. A testnet run was therefore rehearsing a different strategy than the
+    one mainnet would run, which is the only thing testnet is for.
+    """
+
+    CONFIG = """\
+name: t
+symbol: BTC
+discipline:
+  long_threshold: 60.0
+  short_threshold: 40.0
+  btc_trend_filter: false
+execution:
+  dry_run: true
+  testnet: true
+"""
+
+    def _cfg(self):
+        path = write_config(self.CONFIG)
+        self.addCleanup(os.unlink, path)
+        return load_config(path)
+
+    # -- the helper itself ------------------------------------------------
+
+    def test_a_testnet_client_yields_a_separate_mainnet_data_client(self):
+        from agent.market_data import MAINNET_URL, HyperliquidMarket, mainnet_data_market
+
+        exec_market = HyperliquidMarket(testnet=True)
+        data = mainnet_data_market(exec_market)
+        self.assertFalse(data.testnet)
+        self.assertIsNot(data, exec_market)
+        self.assertEqual(data.base_url, MAINNET_URL.rstrip("/"))
+
+    def test_a_mainnet_client_is_reused_rather_than_duplicated(self):
+        """Also what keeps a backtest from opening a network-backed client: the
+        backtest market reports `testnet = False`, so it is handed straight
+        back to the factors."""
+        from agent.market_data import HyperliquidMarket, mainnet_data_market
+
+        market = HyperliquidMarket(testnet=False)
+        self.assertIs(mainnet_data_market(market), market)
+
+    def test_no_client_at_all_yields_a_mainnet_one(self):
+        from agent.market_data import mainnet_data_market
+
+        self.assertFalse(mainnet_data_market(None).testnet)
+
+    def test_a_client_without_a_testnet_flag_is_treated_as_mainnet(self):
+        """Test doubles do not all carry the attribute, and creating a real
+        client behind a caller's back is the failure this guards."""
+        from agent.market_data import mainnet_data_market
+
+        fake = type("M", (), {})()
+        self.assertIs(mainnet_data_market(fake), fake)
+
+    # -- the synthesizer ---------------------------------------------------
+
+    def test_the_synthesizer_reads_all_three_factors_from_mainnet(self):
+        from agent.synthesizer import Synthesizer
+
+        syn = Synthesizer(self._cfg())
+        self.assertTrue(syn.market.testnet, "the execution client should be testnet")
+        self.assertFalse(syn.data_market.testnet)
+        for name, market in (
+            ("smart_money", syn.smart_money.market),
+            ("technical", syn.technical.market),
+            ("market", syn.market_factor.market),
+        ):
+            with self.subTest(factor=name):
+                self.assertFalse(market.testnet)
+        self.assertFalse(syn.smart_money.data_market.testnet)
+
+    def test_an_injected_data_market_is_honoured(self):
+        from agent.market_data import HyperliquidMarket
+        from agent.synthesizer import Synthesizer
+
+        injected = HyperliquidMarket(testnet=False)
+        syn = Synthesizer(self._cfg(), data_market=injected)
+        self.assertIs(syn.data_market, injected)
+        self.assertIs(syn.technical.market, injected)
+        self.assertIs(syn.market_factor.market, injected)
+
+    # -- auditability ------------------------------------------------------
+
+    def test_the_market_factor_reports_which_venue_its_data_came_from(self):
+        """All three factors state their data network, so a factor reading the
+        wrong venue is visible in the journal instead of silent. This is the
+        field that would have caught the defect when it was introduced."""
+        for flag, expected in ((False, "mainnet"), (True, "testnet")):
+            with self.subTest(testnet=flag):
+                f = MarketFactor(FakeMarket(FakeContext(), testnet=flag))
+                self.assertEqual(f.evaluate("BTC").details["data_network"], expected)
+
+    def test_the_technical_factor_reports_it_even_when_it_cannot_read(self):
+        """The early-return path must carry the field too: a factor that fails
+        to compute is exactly when someone asks where its data came from."""
+        from agent.factors.technical import TechnicalFactor
+
+        cfg = self._cfg()
+        for flag, expected in ((False, "mainnet"), (True, "testnet")):
+            with self.subTest(testnet=flag):
+                f = TechnicalFactor(FakeMarket(FakeContext(), testnet=flag),
+                                    cfg.indicators)
+                score = f.evaluate("BTC")     # FakeMarket has no `candles`
+                self.assertEqual(score.details["data_network"], expected)
+
+    def test_all_three_factors_agree_on_the_key(self):
+        """Two names for one concept is how a reader compares them wrongly."""
+        import inspect
+
+        from agent.factors.technical import TechnicalFactor
+
+        self.assertIn('details["data_network"]', inspect.getsource(MarketFactor.evaluate))
+        self.assertIn('"data_network"', inspect.getsource(TechnicalFactor.evaluate))
+
+    # -- the wiring in the agent ------------------------------------------
+
+    def test_the_agent_splits_gates_from_order_routing(self):
+        """Gates and the ATR behind the stop distance are decision inputs, so
+        they follow the data market. Order routing, account equity and mark
+        price stay on the execution venue."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cfg = self._cfg()
+        agent = FoxAgent(
+            cfg,
+            journal_path=str(Path(tmp.name) / "journal.jsonl"),
+            state_path=str(Path(tmp.name) / "state.json"),
+        )
+
+        self.assertTrue(agent.market.testnet)
+        self.assertFalse(agent.data_market.testnet)
+        self.assertIs(agent.discipline.market, agent.data_market)
+        self.assertIs(agent.synthesizer.technical.market, agent.data_market)
+        self.assertIs(agent.synthesizer.market_factor.market, agent.data_market)
+        self.assertIs(agent.broker.market, agent.market)
+
+    def test_sizing_reads_the_data_market_for_its_atr(self):
+        """Source-level, because the call sits inside the trading cycle and a
+        behavioural test would need a fully stubbed cycle to reach it.
+
+        `compute_size` reads candles to get the ATR that sets the stop distance,
+        so it is a decision input: on testnet candles it would size a stop to
+        testnet volatility, which the mainnet run would never place. The price
+        it receives is a separate argument and does come from the execution
+        venue, because that is the price actually paid.
+        """
+        import inspect
+
+        normalized = " ".join(inspect.getsource(FoxAgent.run_cycle).split())
+        self.assertIn("compute_size( self.data_market,", normalized)
+
+    def test_mainnet_execution_keeps_one_single_client(self):
+        """On mainnet the split must be a no-op, or this change would alter
+        behaviour that 853 tests and every recorded result were measured on."""
+        from agent.market_data import HyperliquidMarket
+        from agent.synthesizer import Synthesizer
+
+        cfg = self._cfg()
+        cfg.execution.testnet = False
+        market = HyperliquidMarket(testnet=False)
+        syn = Synthesizer(cfg, market)
+        self.assertIs(syn.data_market, market)
+        self.assertIs(syn.technical.market, market)
+        self.assertIs(syn.market_factor.market, market)
+
+
 class TestParallelWalletReads(unittest.TestCase):
     """25 sequential wallet reads measured 58s; they must run concurrently."""
 

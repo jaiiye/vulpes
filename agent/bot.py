@@ -38,7 +38,7 @@ from .execution import (
     is_reversal_signal,
     compute_size,
 )
-from .market_data import HyperliquidMarket, MarketDataError
+from .market_data import HyperliquidMarket, MarketDataError, mainnet_data_market
 from .state import DEFAULT_STATE_PATH, AgentState, StateStore
 from .synthesizer import LONG, SHORT, Journal, Signal, Synthesizer
 
@@ -83,11 +83,21 @@ class FoxAgent:
         self.cfg = config
         self.journal = Journal(journal_path)
         self.store = StateStore(state_path)
+        #: Order routing, account equity, mark price, reconciliation - the
+        #: things that genuinely live on whichever venue the orders go to.
         self.market = HyperliquidMarket(
             testnet=config.execution.testnet, base_url=config.execution.base_url
         )
-        self.synthesizer = Synthesizer(config, self.market)
-        self.discipline = Discipline(config, self.market)
+        #: Every decision input: the three factors, the gates, and the ATR
+        #: behind the stop distance. Always mainnet, so `testnet: true`
+        #: rehearses the mainnet strategy instead of a different one.
+        #:
+        #: On mainnet this is the *same object* as `self.market`, so nothing
+        #: about a mainnet run or the backtest changes. The split only has an
+        #: effect when the execution venue is testnet.
+        self.data_market = mainnet_data_market(self.market)
+        self.synthesizer = Synthesizer(config, self.market, data_market=self.data_market)
+        self.discipline = Discipline(config, self.data_market)
         self.broker = Broker(
             config, self.market, self.journal, on_unprotected=self._handle_unprotected
         )
@@ -461,8 +471,13 @@ class FoxAgent:
 
         # --- 6. Size and execute.
         try:
+            # `data_market`, not `self.market`: this reads candles for the ATR
+            # that sets the stop distance, which is a decision input. Sizing on
+            # testnet-candle volatility would size a stop the mainnet run would
+            # never use. `price` is passed separately and does come from the
+            # execution venue, because that is the price actually paid.
             sizing = compute_size(
-                self.market, self.cfg, symbol, signal.action, price, equity
+                self.data_market, self.cfg, symbol, signal.action, price, equity
             )
         except ExecutionError as exc:
             self.log(f"  SIZING FAILED: {exc}")
