@@ -9,7 +9,14 @@ symbol: BTC
 
 # Start with a preset, then override individual values below.
 # conservative | balanced | aggressive
-risk_preset: conservative
+#
+# The six preset fields are restated explicitly in this file so the effective
+# configuration can be read without opening the code. That makes them the
+# authority: the loader merges presets with `setdefault`, so a value written
+# here wins over the preset. A test asserts they equal the named preset's
+# values, which turns a stale preset into a failure rather than a config that
+# quietly runs something other than what it says.
+risk_preset: balanced
 
 # ---------------------------------------------------------------------------
 # Factor weights. Must be positive; they are normalised to sum to 1.0.
@@ -45,10 +52,16 @@ indicators:
 #   * Pure TA -18%, mean reversion -33% / -22%.
 # ---------------------------------------------------------------------------
 discipline:
-  long_threshold: 60.0        # conservative preset
-  short_threshold: 40.0
-  max_signals_per_day: 3      # cap on new entries per symbol per day
-  cooldown_minutes: 240       # minimum gap between entries
+  long_threshold: 55.0        # balanced preset: 60/40 -> 55/45
+  short_threshold: 45.0
+  # Both are wall-clock limits, not bar counts: 120 minutes is 2 bars on 1h and
+  # 8 on 15m, so the cooldown binds less on a finer timeframe. Measured at the
+  # conservative 3 / 240, neither was tight - the engine's rejection counters
+  # never recorded a `daily cap` event, and entries ran at ~0.19 per symbol per
+  # day against a cap of 3. Loosening both moved the count by 2 (130 -> 132),
+  # so the difference from conservative is mostly the thresholds, not these.
+  max_signals_per_day: 5      # cap on new entries per symbol per day
+  cooldown_minutes: 120       # minimum gap between entries
   require_smart_money_alignment: true   # Bison's rule: disagree means no trade
   btc_trend_filter: true                # no dip-buying while BTC 4h is down
   btc_trend_timeframe: 4h
@@ -74,8 +87,13 @@ min_confidence: 0.35
 # ---------------------------------------------------------------------------
 risk:
   account_allocation_pct: 10.0   # max share of equity as notional
-  leverage: 2                    # experiment winners used low leverage
-  risk_per_trade_pct: 1.0        # risk budget per trade
+  # balanced preset. These two are the fields where the preset changes the risk
+  # of the run rather than its signal rate: doubling the per-trade risk budget
+  # and raising leverage from 2x to 3x. The measured edge did not improve to
+  # pay for it - the random-direction baseline beat the strategy in 20 runs out
+  # of 20. See the entry-signal section of the README.
+  leverage: 3
+  risk_per_trade_pct: 2.0        # risk budget per trade
   max_position_usd: 0            # 0 = derive from equity
   stop_loss_enabled: true
   stop_loss_pct: 3.0             # ignored while stop_loss_atr_multiple > 0

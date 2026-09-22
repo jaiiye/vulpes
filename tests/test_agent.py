@@ -1225,6 +1225,50 @@ class TestConfigValidation(unittest.TestCase):
         self.assertTrue(cfg.execution.dry_run)
         self.assertTrue(cfg.discipline.require_smart_money_alignment)
 
+    def test_shipped_config_restates_its_named_preset_faithfully(self):
+        """An explicit value silently wins over the named preset.
+
+        `load_config` merges a preset with `setdefault`, so anything the file
+        spells out is the authority and the preset only fills the gaps. That
+        makes `risk_preset: balanced` next to a file that still spells out the
+        conservative numbers a rename rather than a change - the config would
+        claim one thing and run another, with nothing to notice the difference.
+
+        Asserted rather than left to review because the failure is invisible:
+        every value involved is valid on its own, so nothing errors. If the
+        preset is ever retuned, this fails and forces the file to be updated
+        deliberately instead of drifting away from its own label.
+        """
+        # Imported under aliases on purpose: this module already imports a
+        # *different* `Discipline` (the runtime gate object from
+        # `agent.discipline`), and the bare name would quietly pick that one up.
+        from agent.config import (
+            RISK_PRESETS,
+            Discipline as DisciplineSettings,
+            Risk as RiskSettings,
+        )
+
+        cfg_path = Path(__file__).resolve().parents[1] / "bots" / "fox_btc.yaml"
+        cfg = load_config(cfg_path)
+        preset = RISK_PRESETS[cfg.risk_preset]
+
+        restated = {}
+        for field in preset:
+            if field in DisciplineSettings.__dataclass_fields__:
+                restated[field] = getattr(cfg.discipline, field)
+            elif field in RiskSettings.__dataclass_fields__:
+                restated[field] = getattr(cfg.risk, field)
+        self.assertEqual(sorted(restated), sorted(preset))
+
+        for field, value in preset.items():
+            with self.subTest(field=field):
+                self.assertEqual(
+                    restated[field],
+                    value,
+                    f"the shipped config is labelled {cfg.risk_preset!r} but "
+                    f"{field} is {restated[field]!r}, not the preset's {value!r}",
+                )
+
 
 # ---------------------------------------------------------------------------
 # Data layer: unit handling and leaderboard parsing
