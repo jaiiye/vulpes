@@ -2940,6 +2940,27 @@ class TestStartupReconciliation(unittest.TestCase):
         agent.reconcile_startup()  # must not raise or clear it
         self.assertIsNotNone(agent.position)
 
+    def test_a_client_build_failure_becomes_a_halt_not_a_dead_process(self):
+        """The measured crash, pinned.
+
+        A transient SSL error while lazily building the SDK used to escape
+        every handler here because it was not an `ExecutionError`, and the
+        process died seconds after start - before `run()`'s per-cycle handler,
+        the one built to survive errors, had begun. Now the build failure
+        arrives as an `ExecutionError`, so `reconcile_startup` does what it is
+        written to do: refuse to trade while the true position is unknown.
+        """
+        agent = self.make_agent()
+        agent.cfg.execution.dry_run = False
+
+        def boom():
+            raise ExecutionError("could not initialise the Hyperliquid clients")
+
+        agent.broker.live_positions = boom
+        with self.assertRaises(CriticalExecutionError) as ctx:
+            agent.reconcile_startup()
+        self.assertIn("reconciliation failed", str(ctx.exception))
+
     def test_persisted_halt_is_restored(self):
         state = AgentState()
         state.agent_halted = True
@@ -3025,6 +3046,87 @@ class TestDrawdownGuard(unittest.TestCase):
 
         reloaded = agent.store.load()
         self.assertAlmostEqual(reloaded.peak_equity, 1000.0)
+
+    # -- the watermark belongs to a measurement basis ----------------------
+
+    def test_the_watermark_is_tagged_with_its_basis(self):
+        agent = self.make_agent()
+        agent.check_drawdown(1000.0)
+        self.assertEqual(agent.store.load().peak_equity_mode, "dry_run")
+
+    def test_switching_to_live_does_not_halt_on_the_dry_run_peak(self):
+        """The trap this tag exists for.
+
+        A dry run's equity is `DRY_RUN_EQUITY_USD` - a constant chosen for
+        readable sizing, not a fact about the account - so the peak it writes is
+        meaningless for real money. Measured before the fix, sharing one state
+        file:
+
+            dry run, DRY_RUN_EQUITY_USD=100000 -> peak_equity 100000.0
+            then live, real equity ~998        -> "drawdown 99.00% from peak
+                                                   $100,000.00" -> HALTED
+
+        And because the halt is persisted while `--clear-halt` does not remove
+        the condition, the run stayed halted. That is the order the README
+        recommends, so it was the default path rather than an edge case.
+        """
+        agent = self.make_agent()
+        agent.cfg.execution.dry_run = True
+        agent.check_drawdown(100_000.0)
+
+        agent.cfg.execution.dry_run = False
+        self.assertIsNone(agent.check_drawdown(998.0))
+        self.assertAlmostEqual(agent.state.peak_equity, 998.0)
+        self.assertEqual(agent.state.peak_equity_mode, "live")
+
+    def test_switching_back_to_dry_run_does_not_halt_either(self):
+        """The same in reverse: a live high-water mark must not stop a dry run
+        the instant it starts."""
+        agent = self.make_agent()
+        agent.cfg.execution.dry_run = False
+        agent.check_drawdown(5000.0)
+
+        agent.cfg.execution.dry_run = True
+        self.assertIsNone(agent.check_drawdown(1000.0))
+        self.assertAlmostEqual(agent.state.peak_equity, 1000.0)
+
+    def test_an_untagged_peak_is_kept_and_labelled(self):
+        """A file written before the tag existed may hold a genuine watermark.
+        Discarding it would make the breaker less eager, so it is adopted - and
+        labelled, so the next mode switch is the one that resets it."""
+        agent = self.make_agent()
+        agent.state.peak_equity = 1000.0          # no basis recorded
+        self.assertIsNone(agent.check_drawdown(900.0))
+        self.assertAlmostEqual(agent.state.peak_equity, 1000.0)
+        self.assertEqual(agent.state.peak_equity_mode, "dry_run")
+
+    def test_a_real_drawdown_within_one_basis_still_fires(self):
+        """The tag must not be a way to disable the guard."""
+        agent = self.make_agent()
+        agent.state.peak_equity = 1000.0
+        agent.state.peak_equity_mode = "dry_run"
+        self.assertIsNotNone(agent.check_drawdown(800.0))
+
+    def test_reset_peak_clears_the_watermark_through_the_cli(self):
+        """Exercised through `run_bot.main` so the flag is covered too, not just
+        the dataclass fields."""
+        import contextlib
+        import io
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from run_bot import main
+
+        agent = self.make_agent()
+        agent.check_drawdown(1000.0)
+
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            rc = main(["--reset-peak", "--state", str(agent.store.path)])
+
+        self.assertEqual(rc, 0)
+        self.assertIn("resetting drawdown peak", captured.getvalue())
+        reloaded = agent.store.load()
+        self.assertEqual(reloaded.peak_equity, 0.0)
+        self.assertEqual(reloaded.peak_equity_mode, "")
 
 
 class TestClosePositionContract(unittest.TestCase):

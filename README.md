@@ -75,7 +75,7 @@ backtest/                   研究与回测（不参与实盘）
   whale_history.py          从资金费记录重建历史鲸鱼持仓
   historical_smart_money.py 用重建的鲸鱼历史服务聪明钱因子
   position_history.py       持仓历史的落盘与读取
-tests/                      885 个离线测试，16 个文件
+tests/                      898 个离线测试，16 个文件
 ```
 
 **成交时点只有一份实现**（`trend_gate.simulate_flags`），四个信号模块都复用它。
@@ -326,7 +326,7 @@ use_hyperfeed: true
 python -m unittest discover -s tests -v
 ```
 
-885 个离线测试，覆盖：指标数值正确性、因子打分方向、置信度加权与权重再分配、
+898 个离线测试，覆盖：指标数值正确性、因子打分方向、置信度加权与权重再分配、
 数据规范化（推导公式、符号归属、跨来源一致性、费用模型、列裁剪比例、同步规划）、
 历史仓位重建（陈旧窗口、未实现盈亏可用性、引擎警告准确性）、
 排行榜重建（排名依据、封顶次序、缓存失效、窗口覆盖度、SQL 传输方式、活跃度上限）、
@@ -3974,6 +3974,108 @@ journal 记的是       -> "FAILED to attach stop ... Position is unprotected."
   小账户按 `account_allocation_pct` 算出的名义额可能卡在这条线以下。
 - **测试网端点会抖**：过程中真实出现过两次 SSL 中断（`UNEXPECTED_EOF`），
   重试即恢复。生产上需要留意重试预算。
+
+---
+
+## 第八轮：把 agent 循环真跑起来（含一次连续运行）
+
+第七轮验证的是 `Broker` 的方法。这一轮把**整个 agent 循环**在测试网上跑通，包括此前
+唯一未覆盖的那一段。
+
+### 补齐的实盘覆盖
+
+派生一份配置（从 `bots/fox_btc.yaml` 读入、只改 `volume_confirm: false`、写到临时路径 ——
+**刻意不提交一个「关掉安全门禁」的配置文件**：那会与真实配置漂移，而且是个脚枪），
+然后 `--live` 跑：
+
+| 环节 | 实测 |
+|---|---|
+| 对账（一致） | `reconciliation: tracked position matches the exchange (LONG 0.00115 BTC)` |
+| 对账（消失） | `RECONCILED: tracked LONG ... no longer exists on the exchange; clearing` |
+| 头寸计算 | `10% of $998.71 = $99.87 -> 0.00115217 BTC (margin ~$33.29 at 3x)`、`reward:risk = 6.77` |
+| 入场 | `order_submitted` → `order_filled` (`avg_price 86698.6`) |
+| **保护单** | `protection_placed` ×2，交易所真值 `85528.0`(止损) + `94482.0`(止盈) |
+| 持仓管理 | `holding LONG ... mark 8.676e+04, unrealised $+0.07` |
+| 落库 | state 里 `position` + `stop_price` + `take_profit_price` 齐备 |
+
+注意 `trigger_px` 显示为 `85528.0` / `94482.0` —— **A 的取整生效**；`protection=stop` /
+`take_profit` 是**C 的字段修复**。第七轮的三个修复在这条完整链路上都被走到了。
+
+### 缺陷：模拟运行会污染实盘的护栏（峰值那条已修）
+
+`peak_equity` 只增不减，而它与 `DRY_RUN_EQUITY_USD` 共用同一个 state 文件。实测：
+
+```
+第 1 步  模拟运行，DRY_RUN_EQUITY_USD=100000  ->  peak_equity = 100000.0
+第 2 步  切实盘，真实权益 ~998                 ->  drawdown 99.00% from peak $100,000.00
+                                              ->  agent is HALTED（且被持久化）
+```
+
+**因为停机被持久化、而 `--clear-halt` 不改变触发条件，这个运行会一直停着走不出去。**
+而它正是 README 推荐的工作流（「先用模拟模式充分验证」），所以是默认路径而不是边角情况。
+
+修法是把峰值**按测量基准打标**（`AgentState.peak_equity_mode`，`"live"` / `"dry_run"`）：
+基准不同则重设峰值；**未打标**（旧版本写的）则沿用并补标，而不是丢弃 ——
+丢掉一个真实峰值会让熔断器**更不敏感**，而虚假停机是更安全的失败方向。
+另加 `--reset-peak` 给出出口（原 `--clear-halt` 的提示现在也指向它）。
+
+测试 6 条，变异 5/5 捕获（含原始 bug 本身）。
+
+**同一类污染还有一处，我没有改、只记录**：`last_trade_ts` / `trades_today` /
+`consecutive_losses` 也是干跑与实盘共用。实测一次干跑模拟开仓，让随后的实盘周期被
+`cooldown active, 119 min remaining` 拒绝。**它与峰值的区别是有界**（120 分钟后自愈），
+所以严重性低一个量级 —— 但如果要让干跑真正「不干扰」实盘，这三个字段也需要按基准隔离。
+
+### 缺陷：瞬时网络错误会在 SDK 构造时打崩进程（已修）
+
+连续运行期间撞到一次 SSL 抖动，**进程直接崩掉**（不是被优雅记录）。
+
+准确的逃逸链是（我第一次写这段时把最后一步记成了 `run_cycle`，是错的 ——
+`run()` 的 `except Exception` **确实**包住了周期异常，问题在于崩溃发生在**周期循环开始之前**）：
+
+```
+_ensure_sdk:  self._exchange = Exchange(...)   <- 在 try 之外
+              self._info = Info(base_url, ...)  <- 在 try 之外，且 Info.__init__ 会发网络请求
+live_positions:   self._ensure_sdk()            <- 在它自己的 try 之外
+reconcile_startup: except ExecutionError        <- 原始 SSLError 不是这个类型，接不住
+run():            except CriticalExecutionError <- 也接不住；而它的逐周期兜底还没开始
+```
+
+同一个错误在其它路径是被**重试并降级**的（历史日志里有 8 次
+`cannot price BTC: ... failed after 3 attempts`，都被记录后跳过），因为那些走的是
+`http_util` 的重试封装；而 SDK 的 `Info` 自己用 `requests`、**没有重试**。
+所以**懒构造那一次抖动 = 进程死亡**。
+
+修法两条，都在 `_ensure_sdk` / `_build_clients`：
+
+1. **失败一律转成 `ExecutionError`** —— 那是所有调用方唯一认识的类型，它们各自的降级逻辑
+   （信号层跳过、启动对账拒绝在持仓未知时交易）才接得住
+2. **两个客户端一起赋值** —— 顶部守卫只看 `_exchange`，所以「`_exchange` 已赋值、
+   `Info` 抛了」的半成品**永远不会重建**，之后每次调用都会 `_info is None` 直到重启
+
+另加有界重试（3 次 + 递增退避），因为这类失败本质是瞬时的。
+
+测试 7 条，变异 **4/4** 捕获。过程中有一条变异（「不重试」）第一次**没被捕获** ——
+查下来是**我的测试弱**：`test_it_is_retried_before_giving_up` 数的是**构造函数调用次数**，
+而两个类都计数，于是「2 次尝试 × 1 个构造」与「1 次尝试 × 2 个构造」得到同样的数字，
+**根本区分不出重试**。改成只让第二个客户端失败后才捕获。
+退避时长本身没有测试（要断言 sleep），这一点如实标注。
+
+### 连续运行结果（12 周期 / 15.2 分钟）
+
+| 项 | 结果 |
+|---|---|
+| 周期 | 12，节奏 **78–96 秒**（配置 60s + 约 25s 网络工作） |
+| 错误 / 崩溃 | 0 / 0 |
+| 成交 | 0（12 次信号全部被 `volume` 门禁拒绝，同一根已收盘 bar） |
+
+**这次运行的结论有上限，原因值得记住**：入场周期是 1h 而窗口只有 15 分钟，12 个周期
+全在同一根已收盘 bar 上做判断 —— 12 次拒绝是**同一个决定重复了 12 次**。
+历史日志给出的实际入场率约 **0.44 笔/天**（455 个信号 → 2 笔开仓，跨 4.5 天），
+所以有意义的实盘观察窗口是**月**级别，不是分钟。
+
+（顺带排除一个怀疑：我一度以为 `check_volume` 拿未收盘的 bar 去比完整 bar 的平均，
+会系统性拒绝入场 —— `safe_candles` 里确实调用了 `_drop_incomplete`，**该怀疑不成立**。）
 
 ---
 

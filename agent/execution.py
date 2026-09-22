@@ -483,7 +483,61 @@ class Broker:
     # ------------------------------------------------------------------
     # Live SDK plumbing
     # ------------------------------------------------------------------
+    #: Attempts at building the SDK clients before giving up on this cycle.
+    #:
+    #: The SDK does its own HTTP with no retry of its own, and `Info.__init__`
+    #: fetches spot metadata over the network - so this is the one client
+    #: construction in the process that can fail for a reason unrelated to
+    #: whether the request was right.
+    SDK_INIT_ATTEMPTS = 3
+    SDK_INIT_BACKOFF_SECONDS = 2.0
+
+    def _build_clients(self, exchange_cls, info_cls, wallet, base_url, account_address):
+        """Build both clients, retrying the transient failures.
+
+        Raises `ExecutionError`, never the SDK's own exception type, because
+        that is the only type the callers' handlers know. `Exchange` and `Info`
+        are built in one expression so a failure in the second cannot leave the
+        first assigned - see `_ensure_sdk` for why that mattered.
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, self.SDK_INIT_ATTEMPTS + 1):
+            try:
+                return (
+                    exchange_cls(wallet, base_url, account_address=account_address),
+                    info_cls(base_url, skip_ws=True),
+                )
+            except Exception as exc:  # noqa: BLE001 - re-raised as ExecutionError
+                last_error = exc
+                if attempt < self.SDK_INIT_ATTEMPTS:
+                    time.sleep(self.SDK_INIT_BACKOFF_SECONDS * attempt)
+        raise ExecutionError(
+            f"could not initialise the Hyperliquid clients after "
+            f"{self.SDK_INIT_ATTEMPTS} attempts: "
+            f"{type(last_error).__name__}: {last_error}"
+        ) from last_error
+
     def _ensure_sdk(self) -> None:
+        """Build the exchange and info clients on first use, or raise.
+
+        Two properties here are load-bearing, and both were missing.
+
+        **Failures are `ExecutionError`, not whatever the SDK raised.** Every
+        caller already handles `ExecutionError` and degrades honestly: the
+        signal layer skips, and startup reconciliation refuses to trade while
+        the true position is unknown. A raw `SSLError` out of `Info.__init__`
+        went through all of those handlers untouched - it escaped
+        `live_positions`, escaped `reconcile_startup`'s `except ExecutionError`,
+        and then escaped `run()`'s `except CriticalExecutionError` *before* the
+        loop that IS built to survive cycle errors had started. Measured live:
+        one transient `UNEXPECTED_EOF_WHILE_READING` from the testnet endpoint
+        killed the process outright, seconds after start.
+
+        **The pair is assigned together, after both exist.** The guard at the
+        top tests `_exchange`, so a half-built pair (`_exchange` assigned,
+        `Info` having raised) was never rebuilt: every later call would fail on
+        `_info is None` until the process restarted.
+        """
         if self.dry_run or self._exchange is not None:
             return
 
@@ -505,10 +559,13 @@ class Broker:
 
         base_url = constants.TESTNET_API_URL if self.cfg.execution.testnet else constants.MAINNET_API_URL
         wallet = eth_account.Account.from_key(key)
-
         account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS") or wallet.address
-        self._exchange = Exchange(wallet, base_url, account_address=account_address)
-        self._info = Info(base_url, skip_ws=True)
+
+        exchange, info = self._build_clients(
+            Exchange, Info, wallet, base_url, account_address
+        )
+        self._exchange = exchange
+        self._info = info
         # Retained for the order-status query, which is a plain /info call.
         self._base_url = base_url
         self._account_address = account_address

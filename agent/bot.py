@@ -298,9 +298,38 @@ class FoxAgent:
     # Drawdown guard
     # ------------------------------------------------------------------
     def check_drawdown(self, equity: float) -> str | None:
-        """Track peak equity and report a breach of the drawdown limit."""
+        """Track peak equity and report a breach of the drawdown limit.
+
+        The watermark is tagged with the basis it was measured on, because the
+        two bases are not comparable: live reads the real account, while a dry
+        run reads the constant `DRY_RUN_EQUITY_USD` - a number chosen for
+        readable sizing, not a fact about the account. Sharing one field between
+        them let a dry run halt a live account permanently; the mechanism and
+        the measurement are in `AgentState.peak_equity_mode`.
+
+        A dry run is still allowed to halt on drawdown - varying
+        `DRY_RUN_EQUITY_USD` between runs is a way to rehearse this guard - it
+        just cannot move the live watermark.
+        """
         if equity <= 0:
             return None
+
+        mode = "dry_run" if self.cfg.execution.dry_run else "live"
+        if self.state.peak_equity_mode and self.state.peak_equity_mode != mode:
+            # A watermark from the other basis says nothing about this one, so
+            # start a fresh one. This makes the breaker less eager, which is why
+            # it happens only on a *known* mismatch: an untagged peak is kept,
+            # just below.
+            self.state.peak_equity = equity
+            self.state.peak_equity_mode = mode
+            self._persist()
+            return None
+        if not self.state.peak_equity_mode:
+            # Written before the tag existed. Keep the number - discarding a
+            # real watermark would understate risk - and label it as this
+            # basis, so the next run in the other mode resets it.
+            self.state.peak_equity_mode = mode
+            self._persist()
 
         peak = self.state.peak_equity
         if equity > peak:

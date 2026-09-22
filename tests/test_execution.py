@@ -704,5 +704,129 @@ class TestAccountEquity(ExecutionTestCase):
             compute_size(None, self.cfg, "BTC", "long", 50_000.0, broker.account_equity())
 
 
+class SdkBlip(Exception):
+    """Stands in for `requests.exceptions.SSLError` - the point is only that it
+    is NOT an `ExecutionError`, because that is what the handlers know."""
+
+
+class TestSdkInitFailureIsRecoverable(ExecutionTestCase):
+    """A blip while lazily building the SDK must not kill the process.
+
+    Found by running live. One transient SSL error out of `Info.__init__`
+    escaped `_ensure_sdk`, then `live_positions`, then `reconcile_startup`'s
+    `except ExecutionError`, then `run()`'s `except CriticalExecutionError` -
+    killing the process seconds after start, *before* the loop that is built to
+    survive cycle errors had begun.
+
+    The SDK is not installed in the offline test environment, so these exercise
+    `_build_clients` directly with injected classes rather than pretending to
+    build a real client.
+    """
+
+    def _broker(self):
+        broker = self.broker(exchange=None)
+        broker.SDK_INIT_ATTEMPTS = 2
+        broker.SDK_INIT_BACKOFF_SECONDS = 0
+        return broker
+
+    def test_a_persistent_failure_raises_execution_error_not_the_sdk_type(self):
+        broker = self._broker()
+
+        class Raises:
+            def __init__(self, *a, **k):
+                raise SdkBlip("UNEXPECTED_EOF_WHILE_READING")
+
+        with self.assertRaises(ExecutionError):
+            broker._build_clients(Raises, Raises, None, "u", "a")
+
+    def test_it_is_retried_before_giving_up(self):
+        """Counted per *attempt*, not per constructor.
+
+        Both clients raising would give two calls per attempt, so a count that
+        does not distinguish the two would pass with the retry removed - it did,
+        until this was written to fail only the second client.
+        """
+        broker = self._broker()          # 2 attempts
+        attempts = []
+
+        class FailingInfo:
+            def __init__(self, *a, **k):
+                attempts.append(1)
+                raise SdkBlip("blip")
+
+        with self.assertRaises(ExecutionError):
+            broker._build_clients(
+                lambda *a, **k: "exchange", FailingInfo, None, "u", "a"
+            )
+        self.assertEqual(len(attempts), broker.SDK_INIT_ATTEMPTS)
+
+    def test_a_later_attempt_can_succeed(self):
+        """The failure is transient by nature, so the retry is the thing that
+        turns a dead process into a settled one.
+
+        Only the second client fails, which also pins that a failure there
+        rebuilds the pair rather than keeping the first - it is counted per
+        attempt, not per constructor.
+        """
+        broker = self._broker()
+        broker.SDK_INIT_ATTEMPTS = 3
+        seen = []
+
+        class FlakyInfo:
+            def __init__(self, *a, **k):
+                seen.append(1)
+                if len(seen) < 3:
+                    raise SdkBlip("blip")
+
+        exchange, info = broker._build_clients(
+            lambda *a, **k: "exchange", FlakyInfo, None, "u", "a"
+        )
+        self.assertEqual(len(seen), 3, "should have taken three attempts")
+        self.assertEqual(exchange, "exchange")
+        self.assertIsNotNone(info)
+
+    def test_a_failure_in_the_second_client_assigns_neither(self):
+        """`_ensure_sdk`'s guard tests `_exchange`, so storing it before `Info`
+        exists would make the pair permanently un-buildable - every later call
+        would fail on `_info is None` until the process restarted."""
+        broker = self._broker()
+        broker.SDK_INIT_ATTEMPTS = 1
+
+        class Raises:
+            def __init__(self, *a, **k):
+                raise SdkBlip("blip")
+
+        with self.assertRaises(ExecutionError):
+            broker._build_clients(lambda *a, **k: "exchange", Raises, None, "u", "a")
+        self.assertIsNone(broker._exchange)
+        self.assertIsNone(broker._info)
+
+    def test_the_failure_message_names_the_attempts_and_the_cause(self):
+        broker = self._broker()
+
+        class Raises:
+            def __init__(self, *a, **k):
+                raise SdkBlip("UNEXPECTED_EOF_WHILE_READING")
+
+        with self.assertRaises(ExecutionError) as ctx:
+            broker._build_clients(Raises, Raises, None, "u", "a")
+        message = str(ctx.exception)
+        self.assertIn(str(broker.SDK_INIT_ATTEMPTS), message)
+        self.assertIn("SdkBlip", message)
+        self.assertIn("UNEXPECTED_EOF_WHILE_READING", message)
+
+    # -- the invariant the callers depend on -------------------------------
+
+    def test_live_positions_passes_the_build_failure_through_unchanged(self):
+        """`live_positions` calls `_ensure_sdk` outside its own `try`, so it
+        relies on that method raising only `ExecutionError`. This pins that."""
+        broker = self._broker()
+        broker._ensure_sdk = lambda: (_ for _ in ()).throw(
+            ExecutionError("could not initialise the Hyperliquid clients")
+        )
+        with self.assertRaises(ExecutionError):
+            broker.live_positions()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

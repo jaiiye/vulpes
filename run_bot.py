@@ -84,6 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--reset-peak",
+        action="store_true",
+        help=(
+            "discard the persisted drawdown high-water mark and exit. The mark "
+            "is meant to be a real account high; a dry run with a different "
+            "DRY_RUN_EQUITY_USD can leave a synthetic one behind that halts the "
+            "next live run."
+        ),
+    )
+    p.add_argument(
         "--live",
         action="store_true",
         help="enable live trading (requires --i-understand-the-risk)",
@@ -162,6 +172,23 @@ def main(argv: list[str] | None = None) -> int:
         store.save(state)
         print("halt cleared. The drawdown peak is retained, so the same drawdown "
               "will halt again if equity is still below the limit.")
+        print("If the peak itself is wrong - a dry run with a different "
+              "DRY_RUN_EQUITY_USD can leave a synthetic one - use --reset-peak.")
+        return 0
+
+    if args.reset_peak:
+        state = store.load()
+        if state is None:
+            print(f"no state at {args.state}; nothing to reset")
+            return 0
+        basis = state.peak_equity_mode or "unlabelled"
+        print(f"resetting drawdown peak {state.peak_equity:,.2f} (basis {basis!r})")
+        state.peak_equity = 0.0
+        state.peak_equity_mode = ""
+        store.save(state)
+        print("peak reset; the next cycle sets a fresh one from the equity it "
+              "reads. A halt already in force is cleared separately, with "
+              "--clear-halt.")
         return 0
 
     agent = FoxAgent(config, journal_path=args.journal, state_path=args.state)

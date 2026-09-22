@@ -61,6 +61,23 @@ class AgentState:
 
     # --- Risk accounting -------------------------------------------------
     peak_equity: float = 0.0
+    #: Which measurement basis `peak_equity` was taken on: "live" or "dry_run".
+    #:
+    #: A high-water mark is only comparable against equity measured the same
+    #: way. The two bases are not: a live run reads the real account, while a
+    #: dry run reads the constant `DRY_RUN_EQUITY_USD`, which is a number chosen
+    #: for readable sizing rather than a fact about the account. Sharing one
+    #: field between them meant a dry run poisoned the live breaker - measured,
+    #: dry with `DRY_RUN_EQUITY_USD=100000` then live at ~998 halted immediately
+    #: with "drawdown 99.00% from peak $100,000.00", and because the halt is
+    #: persisted the run stayed halted. That is the README's recommended workflow
+    #: ("practise in dry-run first"), so it was the default path, not an edge
+    #: case.
+    #:
+    #: Empty means "written by a version that did not record it", which is
+    #: adopted rather than discarded: dropping a real watermark would make the
+    #: breaker *less* eager, and a false halt is the safe direction to fail in.
+    peak_equity_mode: str = ""
     realised_pnl: float = 0.0
 
     # --- Agent-level halt -------------------------------------------------
@@ -128,6 +145,7 @@ class StateStore:
         state.day_anchor = _as_float(state.day_anchor)
         state.halted_until = _as_float(state.halted_until)
         state.peak_equity = _as_float(state.peak_equity)
+        state.peak_equity_mode = str(state.peak_equity_mode or "")
         state.realised_pnl = _as_float(state.realised_pnl)
         state.consecutive_losses = int(_as_float(state.consecutive_losses))
         state.halt_reason = str(state.halt_reason or "")
