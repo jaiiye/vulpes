@@ -35,12 +35,45 @@ from .execution import (
     CriticalExecutionError,
     ExecutionError,
     Position,
+    SizingResult,
     is_reversal_signal,
     compute_size,
 )
 from .market_data import HyperliquidMarket, MarketDataError, mainnet_data_market
 from .state import DEFAULT_STATE_PATH, AgentState, StateStore
 from .synthesizer import LONG, SHORT, Journal, Signal, Synthesizer
+
+
+def entry_line(
+    action: str, size: float, symbol: str, price: float, sizing: SizingResult
+) -> str:
+    """The line printed when a position is opened.
+
+    A function rather than an inline f-string because this is the only record a
+    human reads for an entry, and the line is built inside `run_cycle` - where
+    reaching it behaviourally needs a fully stubbed cycle (signal, gates,
+    pricing, sizing and the broker all faked).
+
+    Pulling it out is not cosmetic. The stop is what makes `risk_usd` mean
+    anything, and the line printed the one without the other. It was asserted
+    through the source of `run_cycle` for a while, and that test passed for the
+    wrong reason: its character window ran past the log statement into the
+    `open_position(..., stop_price=...)` call below it, so it found `stop_price`
+    there whether or not this line carried it.
+    """
+    levels = []
+    if sizing.stop_price is not None:
+        levels.append(f"stop {sizing.stop_price:,.6g}")
+    if sizing.take_profit_price is not None:
+        levels.append(f"tp {sizing.take_profit_price:,.6g}")
+    tail = ", " + ", ".join(levels) if levels else ""
+    # `,.6g`, not the `.4g` this used to carry: four significant figures turns
+    # a BTC price of 87000 into `8.7e+04`. The stop and the target would read
+    # the same way, and this is the line a human checks the run against.
+    return (
+        f"  ENTER {action.upper()} {size:.6g} {symbol} @ {price:,.6g} "
+        f"(notional ${sizing.notional:,.2f}, risk ${sizing.risk_usd:.2f}{tail})"
+    )
 
 
 @dataclass
@@ -520,10 +553,7 @@ class FoxAgent:
             self.log("  SIZING produced zero size; skipping")
             return
 
-        self.log(
-            f"  ENTER {signal.action.upper()} {sizing.size:.6g} {symbol} @ {price:.4g} "
-            f"(notional ${sizing.notional:,.2f}, risk ${sizing.risk_usd:.2f})"
-        )
+        self.log(entry_line(signal.action, sizing.size, symbol, price, sizing))
 
         try:
             self.position = self.broker.open_position(
@@ -610,7 +640,7 @@ class FoxAgent:
         later, and the caller must not treat the account as flat.
         """
         try:
-            pnl = self.broker.close_position(position, price, reason)
+            result = self.broker.close_position(position, price, reason)
         except ExecutionError as exc:
             # The exchange may or may not have closed it. Do not assume either
             # way: leave the position tracked and let reconciliation resolve it.
@@ -618,10 +648,26 @@ class FoxAgent:
             self.journal.event("error", message=f"close failed: {exc}")
             return False
 
+        # GROSS, and deliberately so: this is the figure the run stats and the
+        # guardrails act on. `CloseResult` carries why the two are kept apart.
+        pnl = result.pnl
         self.stats.realised_pnl += pnl
         self.stats.exits += 1
         self.discipline.record_outcome(pnl)
-        self.log(f"  CLOSED {position.side.upper()} {position.symbol}: {reason} -> ${pnl:+.2f}")
+        # Reported net when the cost is modelled, gross and labelled when it is
+        # not: printing the same number in both cases would present a gross
+        # result as if it were what the trade left behind.
+        if result.costs_known:
+            self.log(
+                f"  CLOSED {position.side.upper()} {position.symbol} @ {price:,.6g}: "
+                f"{reason} -> gross ${result.pnl:+.4f} - fees ${result.cost_usd:.4f} "
+                f"= net ${result.pnl_net:+.4f}"
+            )
+        else:
+            self.log(
+                f"  CLOSED {position.side.upper()} {position.symbol} @ {price:,.6g}: "
+                f"{reason} -> ${result.pnl:+.4f} (venue fees not tracked)"
+            )
         self.journal.event(
             "position_closed",
             symbol=position.symbol,

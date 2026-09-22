@@ -132,16 +132,116 @@ fi
 
 # --------------------------------------------------------------------------
 # 2. One dry-run decision cycle.
+#
+# The console output is reduced to one summary line per pass, but trades are
+# read from the JOURNAL rather than scraped out of that output. The old filter
+# (`grep -E 'factors:|cycle'`) silently dropped `ENTER`, `CLOSED` and every
+# rejection reason - a background run could open and close a position and the
+# log would not mention it. Reading the journal fixes that for a structural
+# reason rather than a better pattern: the wording of a console line is prose
+# that gets reworded, and a trade falling out of the log because a sentence
+# changed is the one failure this log cannot afford.
 # --------------------------------------------------------------------------
-out=$("$PYTHON" run_bot.py --config "$CONFIG" --cycles 1 2>&1)
+journal_lines_before=$(if [[ -s "$JOURNAL" ]]; then wc -l <"$JOURNAL"; else echo 0; fi)
+
+# `--journal` is passed explicitly rather than relying on the bot's default:
+# this pass reads the journal back to report the trades it produced, so the two
+# have to be the same file even if that default ever changes.
+out=$("$PYTHON" run_bot.py --config "$CONFIG" --journal "$JOURNAL" --cycles 1 2>&1)
 rc=$?
 if (( rc == 0 )); then
-    # The last few lines carry the signal verdict and the cycle summary.
-    summary=$(printf '%s' "$out" | grep -E 'factors:|cycle' | tail -3 | tr '\n' '|')
-    log "cycle OK: ${summary:-no signal}"
+    # `tail -1` each, not `tail -3` on a combined pattern: the cycle summary is
+    # printed twice (once through the logger, once at the end of main), and the
+    # combined pattern recorded both, so every pass read as duplicated.
+    factors=$(printf '%s' "$out" | grep -E 'factors:' | tail -1)
+    cycles=$(printf '%s' "$out" | grep -E 'cycles \|' | tail -1)
+    log "cycle OK: ${factors:-no factor line} | ${cycles:-no summary}"
 else
     failures=$((failures + 1))
     log "cycle FAILED (rc=$rc): $(printf '%s' "$out" | tail -5 | tr '\n' '|')"
+fi
+
+# --------------------------------------------------------------------------
+# 3. Anything this pass actually did, one line per event.
+#
+# `position_opened` / `position_closed` are the trade-level events and exist in
+# both modes; `close_simulated` adds the cost breakdown that only a simulated
+# close has. The failure kinds are included because they are rare and are the
+# ones worth waking up for.
+# --------------------------------------------------------------------------
+trades=$("$PYTHON" - "$JOURNAL" "$journal_lines_before" <<'PY'
+import json
+import sys
+
+path, before = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+except FileNotFoundError:
+    raise SystemExit(0)
+
+
+def signed(value) -> str:
+    # "n/a", not "$?" - that sequence already means "last exit code" to anyone
+    # reading a shell log, and it would be read as a value rather than as an
+    # absence.
+    return "n/a" if value is None else f"${value:+.4f}"
+
+
+def number(value) -> str:
+    """Six significant figures, which is what these fields carry.
+
+    Not `str(value)`: a stop of `84075.18462613407` is correct and unreadable,
+    and this log is read by eye.
+    """
+    try:
+        return f"{float(value):,.6g}"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def field(rec: dict, key: str) -> str:
+    return str(rec.get(key, "?"))
+
+
+for line in lines[before:]:
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    kind = rec.get("kind")
+    if kind == "position_opened":
+        pos = rec.get("position") or {}
+        print(
+            f"OPEN {field(pos, 'side')} {number(pos.get('size'))} "
+            f"{field(pos, 'symbol')} @ {number(pos.get('entry_price'))} "
+            f"notional {number(pos.get('notional'))} stop {number(pos.get('stop_price'))} "
+            f"score {number(rec.get('signal_score'))}"
+        )
+    elif kind == "position_closed":
+        print(
+            f"CLOSE {field(rec, 'side')} {field(rec, 'symbol')} {signed(rec.get('pnl'))} "
+            f"({field(rec, 'reason')}) running {signed(rec.get('realised_pnl_total'))}"
+        )
+    elif kind == "close_simulated":
+        # `$?` on an event written before the fee fields existed: unknown, and
+        # reported as unknown rather than as zero.
+        print(
+            f"COST entry {signed(rec.get('entry_fee_usd'))} "
+            f"+ exit {signed(rec.get('fee_usd'))} -> net {signed(rec.get('pnl_net'))} "
+            f"(gross {signed(rec.get('pnl'))}, {field(rec, 'fee_bps')}bp/leg)"
+        )
+    elif kind in ("order_unfilled", "unwound_unprotected"):
+        print(f"{kind.upper()}: {rec.get('note') or rec.get('symbol')}")
+    elif kind in ("critical", "error"):
+        # Truncated: these are transport errors and their text runs long.
+        print(f"{kind.upper()}: {str(rec.get('message'))[:160]}")
+PY
+)
+if [[ -n "$trades" ]]; then
+    while IFS= read -r line; do
+        log "trade: $line"
+    done <<<"$trades"
 fi
 
 elapsed=$(( $(date +%s) - started ))

@@ -1061,13 +1061,18 @@ class TestCloseConfirmation(ExecutionValueTestCase):
     documented and handled that rule; both close paths did not.
     """
 
-    def test_a_confirmed_close_returns_the_pnl(self):
+    def test_a_confirmed_close_returns_the_gross_pnl_and_unknown_costs(self):
+        """A real fill's fee is the venue's and this code never asks for it, so
+        the result must not claim 0.0 - that would read as a free close, which
+        is the optimistic direction."""
         ex = FakeExchange(order_result=filled(0.00012, 87_000.0))
         broker = self.broker_for(ex)
 
-        pnl = broker.close_position(self.position(), 88_000.0, "test")
+        result = broker.close_position(self.position(), 88_000.0, "test")
 
-        self.assertAlmostEqual(pnl, (88_000.0 - 87_000.0) * 0.00012, places=6)
+        self.assertAlmostEqual(result.pnl, (88_000.0 - 87_000.0) * 0.00012, places=6)
+        self.assertFalse(result.costs_known)
+        self.assertIsNone(result.pnl_net)
         self.assertIn("close_placed", self.journal_text())
 
     def test_a_refused_close_raises_instead_of_returning_a_pnl(self):
@@ -1290,11 +1295,18 @@ class TestSimulatedFees(ExecutionValueTestCase):
         broker = self.dry_broker()
         position = broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
 
-        returned = broker.close_position(position, 95_000.0, "test")
+        result = broker.close_position(position, 95_000.0, "test")
 
         closed = self.event("close_simulated")
         gross = (95_000.0 - 87_000.0) * 0.00012
-        self.assertAlmostEqual(returned, gross, places=6)
+        self.assertAlmostEqual(result.pnl, gross, places=6)
+        self.assertTrue(result.costs_known)
+        # The result carries the net as well, so the console can print it
+        # without re-deriving the same arithmetic in a second place. Compared at
+        # the journal's own precision: the event is `round(..., 4)` while the
+        # result is not, and the console prints 4 places - so 4 is where the two
+        # are supposed to agree.
+        self.assertAlmostEqual(result.pnl_net, closed["pnl_net"], places=4)
         self.assertAlmostEqual(closed["pnl"], gross, places=4)
         self.assertAlmostEqual(
             closed["pnl_net"],

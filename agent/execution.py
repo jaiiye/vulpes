@@ -302,6 +302,51 @@ class RestingOrderOutcome:
     oid: Any = None
 
 
+@dataclass
+class CloseResult:
+    """What a close realised, and what it cost.
+
+    Two figures rather than one, because they are used for two different things
+    and only one of them is charged. `pnl` is GROSS, and is what the run stats
+    and `discipline.record_outcome` read. `pnl_net` is what the trade actually
+    left behind, and is what a human should be shown. Moving the first to the
+    second would change when the guardrails trip on an unchanged trade
+    sequence - a separate decision with its own break with historical logs, so
+    the two are kept apart here rather than conflated.
+
+    The fees are `None` on a real fill, NOT 0.0: the venue charged a real fee
+    and this code never asked what it was, so 0.0 would report a free close.
+    That is the same distinction `universe.correlation_or_none` draws between
+    "there is no relation" and "it cannot be measured" - and 0.0 here would be
+    the optimistic direction, which is the one that misleads.
+    """
+
+    pnl: float
+    entry_fee_usd: float | None = None
+    exit_fee_usd: float | None = None
+
+    @property
+    def costs_known(self) -> bool:
+        return self.exit_fee_usd is not None
+
+    @property
+    def cost_usd(self) -> float:
+        """Total simulated cost. Only meaningful when `costs_known`."""
+        return (self.entry_fee_usd or 0.0) + (self.exit_fee_usd or 0.0)
+
+    @property
+    def pnl_net(self) -> float | None:
+        """Net of simulated fees, or None when they were never measured.
+
+        Deliberately not falling back to `pnl`: a caller that printed the gross
+        figure as if it were net would be making exactly the claim this field
+        exists to prevent.
+        """
+        if not self.costs_known:
+            return None
+        return self.pnl - self.cost_usd
+
+
 def compute_size(
     market: HyperliquidMarket,
     config: BotConfig,
@@ -1351,8 +1396,10 @@ class Broker:
             )
         return result
 
-    def close_position(self, position: Position, price: float, reason: str) -> float:
-        """Close a position and return the realised PnL.
+    def close_position(
+        self, position: Position, price: float, reason: str
+    ) -> CloseResult:
+        """Close a position and report what it realised and what it cost.
 
         The PnL is computed from `price` (the mark price the caller observed)
         rather than from the venue's fill, because the SDK's `market_close`
@@ -1365,11 +1412,11 @@ class Broker:
         gone, and a refused close is precisely the case it must not mistake for
         one - see `_market_close_confirmed` for what that mistake cost.
 
-        The returned figure is GROSS of simulated fees, and deliberately so:
-        the run stats and `discipline.record_outcome` read this value, and
-        moving them to net would change when the guardrails trip on an unchanged
-        trade sequence. The net figure is recorded in the journal instead, where
-        it can be read without changing anything that acts on it.
+        The returned `pnl` is GROSS of simulated fees, and deliberately so: the
+        run stats and `discipline.record_outcome` read it, and moving them to
+        net would change when the guardrails trip on an unchanged trade
+        sequence. The net figure comes back alongside it in `CloseResult` and is
+        journalled, so it can be read without changing anything that acts on it.
         """
         pnl = position.unrealized_pnl(price)
 
@@ -1378,6 +1425,11 @@ class Broker:
             # when the position was opened and carried here (see
             # `Position.entry_fee_usd`); the exit leg is charged now.
             exit_fee = self._simulated_fee(position.size * price)
+            result = CloseResult(
+                pnl=pnl,
+                entry_fee_usd=position.entry_fee_usd,
+                exit_fee_usd=exit_fee,
+            )
             self.journal.event(
                 "close_simulated",
                 symbol=position.symbol,
@@ -1389,7 +1441,7 @@ class Broker:
                 fee_bps=self.cfg.execution.fee_bps,
                 fee_usd=round(exit_fee, 4),
                 entry_fee_usd=round(position.entry_fee_usd, 4),
-                pnl_net=round(pnl - position.entry_fee_usd - exit_fee, 4),
+                pnl_net=round(result.pnl_net, 4),
                 reason=reason,
                 note=(
                     "dry_run active: no order was sent. fee_usd is the exit "
@@ -1397,22 +1449,26 @@ class Broker:
                     "pnl_net = pnl - both"
                 ),
             )
-        else:
-            self._ensure_sdk()
-            try:
-                result = self._market_close_confirmed(position.symbol)
-            except ExecutionError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise ExecutionError(f"market_close failed for {position.symbol}: {exc}") from exc
-            self.journal.event(
-                "close_placed",
-                symbol=position.symbol,
-                reason=reason,
-                result=result,
-            )
+            return result
 
-        return pnl
+        # Not `result`: that name holds the `CloseResult` above, and the venue's
+        # raw response is a different thing entirely.
+        self._ensure_sdk()
+        try:
+            placed = self._market_close_confirmed(position.symbol)
+        except ExecutionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ExecutionError(f"market_close failed for {position.symbol}: {exc}") from exc
+        self.journal.event(
+            "close_placed",
+            symbol=position.symbol,
+            reason=reason,
+            result=placed,
+        )
+        # Fees are None rather than 0.0: the venue charged its own and this code
+        # never asked what they were, so any figure here would be invented.
+        return CloseResult(pnl=pnl)
 
     # ------------------------------------------------------------------
     def check_exits(self, position: Position, mark_price: float) -> str | None:

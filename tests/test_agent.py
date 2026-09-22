@@ -6,6 +6,8 @@ Run with:  python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import math
 import os
@@ -19,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.bot import FoxAgent  # noqa: E402
+from agent.bot import FoxAgent, entry_line  # noqa: E402
 from agent.config import ConfigError, load_config  # noqa: E402
 from agent.discipline import (  # noqa: E402
     Discipline,
@@ -28,9 +30,11 @@ from agent.discipline import (  # noqa: E402
 )
 from agent.execution import (  # noqa: E402
     Broker,
+    CloseResult,
     CriticalExecutionError,
     ExecutionError,
     Position,
+    SizingResult,
     compute_size,
 )
 from agent.indicators import CandleSeries, adx, atr, ema, rsi, sma, supertrend  # noqa: E402
@@ -3165,10 +3169,72 @@ class TestClosePositionContract(unittest.TestCase):
     def test_returns_true_and_clears_the_position_on_success(self):
         agent = self.make_agent()
         agent.position = self.position()
-        agent.broker.close_position = lambda p, price, reason: 12.5
+        # A `CloseResult`, not a bare float: the caller now reports the cost
+        # breakdown as well, and a float here would be read as one that has no
+        # breakdown at all.
+        agent.broker.close_position = lambda p, price, reason: CloseResult(pnl=12.5)
 
         self.assertTrue(agent.close_position(agent.position, 51_000.0, "test"))
         self.assertIsNone(agent.position)
+
+    # ------------------------------------------------------------------
+    # What the console prints for a trade. These live here because they share
+    # this class's fixtures.
+    # ------------------------------------------------------------------
+
+    def close_line(self, result) -> str:
+        """The `CLOSED ...` line `close_position` emits for `result`."""
+        agent = self.make_agent()
+        agent.position = self.position()
+        agent.broker.close_position = lambda p, price, reason: result
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            agent.close_position(agent.position, 51_000.0, "test")
+        lines = [ln for ln in captured.getvalue().splitlines() if "CLOSED" in ln]
+        self.assertEqual(len(lines), 1, captured.getvalue())
+        return lines[0]
+
+    def test_the_close_line_reports_the_net_when_the_cost_is_modelled(self):
+        """It printed the gross figure only, while the journal had carried
+        `pnl_net` ever since the paper record started charging fees - so the
+        line a human reads and the record they analyse disagreed."""
+        line = self.close_line(
+            CloseResult(pnl=1.0, entry_fee_usd=0.004, exit_fee_usd=0.006)
+        )
+
+        self.assertIn("gross $+1.0000", line)
+        self.assertIn("fees $0.0100", line)
+        self.assertIn("net $+0.9900", line)
+
+    def test_the_close_line_says_so_when_the_cost_is_not_known(self):
+        """A real fill's fee is the venue's and is never read here, so labelling
+        the gross figure as a net would claim a free close."""
+        line = self.close_line(CloseResult(pnl=1.0))
+
+        self.assertIn("$+1.0000", line)
+        self.assertIn("venue fees not tracked", line)
+        self.assertNotIn("net ", line)
+
+    def test_the_close_line_names_the_exit_and_keeps_prices_readable(self):
+        """The exit price says what actually happened, and the `.4g` this line
+        used to carry rendered a BTC price as `8.7e+04`."""
+        line = self.close_line(CloseResult(pnl=1.0))
+
+        self.assertIn("@ 51,000", line)
+        self.assertNotIn("e+", line)
+
+    def test_the_stats_still_read_the_gross_figure(self):
+        """The point of the split: the guardrails act on `pnl`, not `pnl_net`,
+        so this change cannot move when they trip."""
+        agent = self.make_agent()
+        agent.position = self.position()
+        agent.broker.close_position = lambda p, price, reason: CloseResult(
+            pnl=1.0, entry_fee_usd=0.5, exit_fee_usd=0.5
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent.close_position(agent.position, 51_000.0, "test")
+
+        self.assertAlmostEqual(agent.stats.realised_pnl, 1.0, places=6)
 
     def test_returns_false_and_keeps_the_position_on_failure(self):
         agent = self.make_agent()
@@ -3183,6 +3249,61 @@ class TestClosePositionContract(unittest.TestCase):
         self.assertIsNotNone(
             agent.position, "a failed close must leave the position tracked"
         )
+
+
+class TestEntryLine(unittest.TestCase):
+    """What the line printed for an entry carries.
+
+    Behavioural, not source-level. The first version of this inspected
+    `run_cycle`'s source through a character window and passed for the wrong
+    reason: the window ran past the log statement into the
+    `open_position(..., stop_price=...)` call below it, so it found
+    `stop_price` there whether or not the line carried it. Deleting the stop
+    from the line did not fail that test - it broke the module's indentation,
+    and that is the only reason the mistake surfaced.
+
+    The line is built by `entry_line` now, so it can be tested by what it says.
+    """
+
+    @staticmethod
+    def sizing(**overrides) -> SizingResult:
+        fields = dict(
+            size=0.00012,
+            notional=10.44,
+            stop_price=84_345.0,
+            take_profit_price=95_823.0,
+            atr=870.0,
+            risk_usd=2.0,
+        )
+        fields.update(overrides)
+        return SizingResult(**fields)
+
+    def line(self, **overrides) -> str:
+        return entry_line("long", 0.00012, "BTC", 87_000.0, self.sizing(**overrides))
+
+    def test_it_names_the_stop(self):
+        """`risk_usd` means nothing without the level it is risked to."""
+        self.assertIn("stop 84,345", self.line())
+
+    def test_it_names_the_take_profit(self):
+        self.assertIn("tp 95,823", self.line())
+
+    def test_it_omits_levels_that_are_not_configured(self):
+        """Stop-loss disabled means no protective order at all; the line must
+        not imply one."""
+        line = self.line(stop_price=None, take_profit_price=None)
+        self.assertIn("risk $2.00)", line)
+        self.assertNotIn("stop", line)
+
+    def test_it_still_carries_size_price_and_notional(self):
+        line = self.line()
+        self.assertIn("ENTER LONG 0.00012 BTC @ 87,000", line)
+        self.assertIn("notional $10.44", line)
+
+    def test_prices_are_readable_rather_than_scientific(self):
+        """`.4g` rendered a BTC price of 87000 as `8.7e+04`, and the stop and
+        the target the same way."""
+        self.assertNotIn("e+", self.line())
 
 
 class TestConfigSafetyRails(unittest.TestCase):
