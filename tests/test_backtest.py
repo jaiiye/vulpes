@@ -165,12 +165,12 @@ class TestNoLookahead(unittest.TestCase):
 
 class TestMetrics(unittest.TestCase):
     def result(self, pnls: list[float], curve=None, equity=1000.0):
-        from backtest.engine import BacktestResult, Trade
+        from backtest.engine import BacktestResult, ExecutedTrade
 
         trades = []
         for i, pnl in enumerate(pnls):
             trades.append(
-                Trade(
+                ExecutedTrade(
                     symbol="BTC",
                     side="long",
                     entry_time=0,

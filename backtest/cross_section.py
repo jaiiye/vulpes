@@ -39,6 +39,14 @@ from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
+from agent.indicators import ema, rsi
+
+# `universe` holds the liquidity helpers and imports nothing from this module,
+# so the direction is safe. Only the liquidity medians are shared; keeping the
+# portfolio layer's own logic separate is deliberate - see the class docstring
+# on `CrossSectionBacktester`.
+from backtest.universe import liquidity_medians
+
 #: A signal maps (panel, bar index, symbol) to a value, or None when it cannot be
 #: computed. Higher values are expected to have HIGHER forward returns; a reversal
 #: signal therefore returns the negated past return rather than a special case
@@ -167,6 +175,96 @@ def turnover_signal(lookback: int) -> SignalFn:
             total += c * v
             count += 1
         return total / count if count else None
+
+    return signal
+
+
+def rsi_signal(period: int = 14) -> SignalFn:
+    """Wilder's RSI, as a cross-sectional ranking key.
+
+    Ranked as-is this longs the *highest* RSI - the momentum reading. The
+    mean-reversion reading needs `negate`, which buys the lowest.
+
+    Built on the same `agent.indicators.rsi` the directional rules use rather
+    than a second implementation. That matters for comparability: a
+    cross-sectional result and a time-series result computed from two different
+    RSIs would not be measuring the same thing, and comparing them is the point
+    of having both.
+
+    Returns None if any price in the window is missing rather than
+    forward-filling. The panel is dense after `universe.filter_by_coverage`
+    (measured: 0 of 235008 cells missing on the 48-symbol pool), so this costs
+    nothing here - but filling a gap would invent a zero return, and a zero
+    return drags RSI toward 50, which is a *value* rather than a missing one.
+    """
+    if period < 2:
+        raise CrossSectionError("rsi period must be >= 2")
+
+    def signal(panel: Panel, i: int, symbol: str) -> float | None:
+        if i - period < 0:
+            return None
+        window: list[float] = []
+        for k in range(i - period, i + 1):
+            px = panel.price(symbol, k)
+            if px is None:
+                return None
+            window.append(px)
+        vals = rsi(window, period)
+        return vals[-1]
+
+    return signal
+
+
+def stretch_signal(ema_period: int = 20, vol_lookback: int = 24) -> SignalFn:
+    """Distance from the symbol's own EMA, in units of its own volatility.
+
+    `(close - EMA) / (stdev of returns * close)`. Negative means the price sits
+    below its mean by some number of typical moves.
+
+    This is the cross-sectional analogue of the Keltner lower-band rule, and it
+    exists because the two obvious candidates are both worse as ranking keys:
+
+    * RSI is bounded, so it saturates. In a market-wide selloff a large part of
+      the universe pins near 0 and the ranking stops discriminating exactly
+      where the signal is supposed to bite.
+    * A raw percentage distance from the mean is not comparable across symbols -
+      5% below the mean is routine for a high-volatility name and extreme for a
+      quiet one, so the ranking would mostly select for volatility.
+
+    Dividing by the symbol's own volatility fixes both. The panel has no
+    high/low columns, so this uses the stdev of returns as the scale rather than
+    ATR - the same normalisation, one column cheaper.
+    """
+    if ema_period < 2 or vol_lookback < 2:
+        raise CrossSectionError("ema_period and vol_lookback must be >= 2")
+    # `agent.indicators.ema` seeds with the SMA of its first `period` inputs and
+    # then recurses. Handing it exactly `period` values therefore returns the
+    # seed itself - the "EMA" would be a plain mean, silently, while still
+    # producing plausible numbers. Four extra spans of history leave the seed's
+    # influence at (1 - 2/(p+1))**(4p), about 3e-4 for p=20, so the result is
+    # the recursive EMA and not the seed.
+    extra = 4 * ema_period
+    span = ema_period + extra
+    warm = max(span, vol_lookback) + 1
+    vol_fn = realized_vol(vol_lookback)
+
+    def signal(panel: Panel, i: int, symbol: str) -> float | None:
+        if i < warm:
+            return None
+        px = panel.price(symbol, i)
+        if px is None or px <= 0:
+            return None
+        prices: list[float] = []
+        for k in range(i - span + 1, i + 1):
+            v = panel.price(symbol, k)
+            if v is None:
+                return None
+            prices.append(v)
+        mid = ema(prices, ema_period)[-1]
+        vol = vol_fn(panel, i, symbol)
+        if mid is None or vol is None or vol <= 0:
+            return None
+        return (px - mid) / (vol * px)
 
     return signal
 
@@ -463,13 +561,11 @@ def random_benchmark(
     return out
 
 
-def percentile_of(value: float, distribution: Iterable[float]) -> float:
-    """Where `value` sits in `distribution`, 0-100."""
-    dist = list(distribution)
-    if not dist:
-        return 0.0
-    below = sum(1 for v in dist if v < value)
-    return below / len(dist) * 100.0
+# `percentile_of` used to be defined here as well, as a second copy of the one
+# in `trend_gate` with identical behaviour. Nothing in this module called it -
+# only a test did - so it was deleted rather than re-exported: a re-export would
+# have kept two names for one function and left the impression that the two
+# could drift. Import it from `backtest.trend_gate`.
 
 
 # ----------------------------------------------------------------------
@@ -588,18 +684,18 @@ def liquid_split(
     The research found the reversal effect only in the less liquid half, so any
     claim about a basket has to say which half it holds. Returning the two sets
     makes that a choice the caller states rather than a default they inherit.
+
+    The medians come from `universe.liquidity_medians` rather than being
+    recomputed here. They used to be recomputed, and the two copies read
+    different accessors - this one `panel.close`, that one `panel.price()`,
+    which filters NaN - so on a panel containing a NaN they would have split the
+    same universe differently. Verified identical on the current archive before
+    merging (172 of 172 symbols), so this is a latent divergence being closed
+    rather than a bug being fixed.
     """
     if not panel.volume:
         raise CrossSectionError("panel has no volume, cannot rank liquidity")
-    medians: dict[str, float] = {}
-    for s in panel.symbols:
-        vals = [
-            c * v
-            for c, v in zip(panel.close[s], panel.volume[s])
-            if c is not None and v is not None
-        ]
-        if vals:
-            medians[s] = statistics.median(vals)
+    medians = liquidity_medians(panel)
     if not medians:
         raise CrossSectionError("no symbol has usable volume")
     ordered = sorted(medians.values())

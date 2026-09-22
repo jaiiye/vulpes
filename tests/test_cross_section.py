@@ -9,11 +9,13 @@ bottom and skips itself when the archive is absent.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
 
+from backtest.trend_gate import percentile_of  # noqa: E402
 from backtest.cross_section import (
     CrossSectionBacktester,
     CrossSectionConfig,
@@ -23,11 +25,13 @@ from backtest.cross_section import (
     liquid_split,
     negate,
     past_return,
-    percentile_of,
+    random_benchmark,
     random_signal,
     realized_vol,
     restrict,
+    rsi_signal,
     slice_rows,
+    stretch_signal,
 )
 
 
@@ -504,6 +508,288 @@ GROUP BY 1, 2 ORDER BY 2, 1;
                     subset, negate(past_return(lag)), hold, cfg, 60
                 ).run()
                 self.assertAlmostEqual(r.net_return_pct, expected, delta=0.5)
+
+
+class TestSegmentStabilityIsReproducible(unittest.TestCase):
+    """The stability study has to be runnable, not remembered.
+
+    RESEARCH.md section 2.6 reports that 3 of 6 non-overlapping segments beat
+    their own random control (P(X >= 3) ~ 0.17, not significant), and that
+    number is the only basis for deciding whether the basket is worth building.
+    It was produced by a throwaway script that was never committed, so for a
+    while nobody could check what universe it had used - in particular whether
+    it had excluded the 117 `@<index>` spot pairs, whose prices run to 2e-07 and
+    whose correlations are therefore ratios of rounding errors.
+
+    This test fixes both problems at once: the exclusion is in the SQL, and the
+    per-segment returns are asserted, so the study is re-run rather than cited.
+    It reproduces the reported result exactly.
+
+    Skipped unless duckdb and the archive are present - same contract as the
+    parity test above.
+    """
+
+    ARCHIVE = Path("data/canonical/candles")
+
+    #: Six equal slices after the warm-up, and the net return each produced.
+    #: Asserted per segment (not just the 3-of-6 count) because a silent change
+    #: that keeps the count equal would otherwise pass - §三.5 records exactly
+    #: that failure mode, where a dead branch made two different inputs agree.
+    BOUNDS = ((60, 466), (466, 872), (872, 1278), (1278, 1684), (1684, 2090))
+    EXPECTED = (-1.00, -10.31, 9.34, 10.06, 34.32, 2.91)
+
+    def test_segments_reproduce_and_three_clear_p75(self):
+        if shutil.which("duckdb") is None:
+            self.skipTest("duckdb not on PATH")
+        if not self.ARCHIVE.is_dir():
+            self.skipTest("no candle archive on this machine")
+
+        sql = f"""
+SELECT coin, epoch_ms(time_bucket(INTERVAL '4 hours', timestamp)) AS t,
+       arg_max(close, timestamp)::DOUBLE AS c, SUM(volume)::DOUBLE AS v
+FROM read_parquet('{self.ARCHIVE}/*.parquet') AS x(
+    coin, timestamp, open, high, low, close, volume, filename)
+WHERE coin NOT LIKE '@%'
+GROUP BY 1, 2 ORDER BY 2, 1;
+"""
+        proc = subprocess.run(
+            ["duckdb", "-json"], input=sql, capture_output=True, text=True,
+            timeout=1800,
+        )
+        if proc.returncode != 0:
+            self.skipTest("archive query failed")
+
+        panel = build_panel(json.loads(proc.stdout))
+        panel = restrict(panel, set(panel.present(60)))
+        cfg = CrossSectionConfig(
+            quantile=0.2, min_symbols=20, fee_bps=3.5, late_exit_factor=0.0
+        )
+        sig = negate(past_return(42))
+
+        bounds = list(self.BOUNDS) + [(2090, len(panel))]
+        above = 0
+        got = []
+        for i, (start, end) in enumerate(bounds):
+            segment = slice_rows(panel, start, end)
+            _, illiquid = liquid_split(segment)
+            subset = restrict(segment, illiquid)
+            result = CrossSectionBacktester(subset, sig, 42, cfg, 0).run()
+            self.assertTrue(result.periods, f"segment {i + 1} produced no periods")
+            got.append(result.net_return_pct)
+
+            benchmark = random_benchmark(subset, 42, cfg, runs=30, seed=1000,
+                                         start_row=0)
+            if percentile_of(result.net_return_pct, benchmark) >= 75:
+                above += 1
+
+        for i, (actual, expected) in enumerate(zip(got, self.EXPECTED), 1):
+            with self.subTest(segment=i):
+                self.assertAlmostEqual(actual, expected, delta=0.5)
+
+        # The headline: three of six, which is P ~ 0.17 under the null and so
+        # is NOT evidence that the basket is worth building. Asserted so that a
+        # future change which makes it look better has to say so out loud.
+        self.assertEqual(above, 3, f"percentiles above p75 changed: {got}")
+
+
+class TestRsiSignal(unittest.TestCase):
+    """RSI as a cross-sectional ranking key.
+
+    The signal is built on the same `agent.indicators.rsi` the directional rules
+    use, so what is worth testing here is not the RSI arithmetic but the three
+    things this wrapper decides: which direction it points, what it returns
+    before it is warm, and what it does with a gap.
+    """
+
+    N = 60
+
+    def _panel(self, falling: bool):
+        a = [100.0 + (-1.0 if falling else 1.0) * i for i in range(self.N)]
+        return make_panel(self.N, {"A": a})
+
+    def test_a_falling_symbol_ranks_below_a_rising_one(self):
+        p = make_panel(self.N, {
+            "DOWN": [100.0 - i for i in range(self.N)],
+            "UP": [100.0 + i for i in range(self.N)],
+        })
+        s = rsi_signal(14)
+        self.assertLess(s(p, self.N - 1, "DOWN"), s(p, self.N - 1, "UP"))
+
+    def test_it_saturates_at_the_extremes(self):
+        """Documents the known weakness rather than hiding it: a monotonic
+        series pins RSI at 0 or 100, so a whole cohort of falling symbols ranks
+        equal and the ordering stops discriminating exactly where a
+        mean-reversion signal is supposed to bite."""
+        p = make_panel(self.N, {
+            "DOWN": [100.0 - i for i in range(self.N)],
+            "UP": [100.0 + i for i in range(self.N)],
+        })
+        s = rsi_signal(14)
+        self.assertAlmostEqual(s(p, self.N - 1, "DOWN"), 0.0)
+        self.assertAlmostEqual(s(p, self.N - 1, "UP"), 100.0)
+
+    def test_it_is_none_during_warmup(self):
+        p = self._panel(falling=True)
+        s = rsi_signal(14)
+        for i in range(14):
+            with self.subTest(i=i):
+                self.assertIsNone(s(p, i, "A"))
+        self.assertIsNotNone(s(p, 14, "A"))
+
+    def test_a_gap_in_the_window_returns_none_rather_than_a_filled_price(self):
+        """Forward-filling would invent a zero return, and a zero return drags
+        RSI toward 50 - a value, not a missing one, so it would rank the symbol
+        as mildly oversold instead of not ranking it at all."""
+        prices = [100.0 - i for i in range(self.N)]
+        prices[self.N - 3] = None
+        p = make_panel(self.N, {"A": prices})
+        s = rsi_signal(14)
+        self.assertIsNone(s(p, self.N - 1, "A"))
+        # The gap only affects windows that contain it.
+        self.assertIsNotNone(s(p, self.N - 10, "A"))
+
+    def test_a_degenerate_period_is_rejected(self):
+        for bad in (0, 1, -5):
+            with self.subTest(period=bad):
+                with self.assertRaises(CrossSectionError):
+                    rsi_signal(bad)
+
+
+class TestStretchSignal(unittest.TestCase):
+    """Distance from the symbol's own EMA, in units of its own volatility.
+
+    The point of dividing by volatility is comparability across symbols, so that
+    is what the tests pin: equal percentage deviations on differently volatile
+    symbols must not rank equal, or the signal would mostly select for
+    volatility.
+    """
+
+    #: Long enough for the EMA's four-extra-span history: the signal needs
+    #: `ema_period + 4 * ema_period` rows before it will speak at all.
+    N = 300
+
+    def _calm_and_wild(self):
+        """Both end 5% below their own EMA; one barely moves, one swings."""
+        calm = [100.0 + (0.1 if i % 2 else -0.1) for i in range(self.N - 1)] + [95.0]
+        wild = [100.0 + (5.0 if i % 2 else -5.0) for i in range(self.N - 1)] + [95.0]
+        return make_panel(self.N, {"CALM": calm, "WILD": wild})
+
+    def test_below_the_mean_is_negative_and_above_is_positive(self):
+        # Multiplicative, not additive: `100 - i` over 300 rows crosses zero,
+        # and a negative price is rejected by the signal's own guard.
+        rising = [100.0 * 1.01 ** i for i in range(self.N)]
+        falling = [100.0 * 0.99 ** i for i in range(self.N)]
+        p = make_panel(self.N, {"UP": rising, "DOWN": falling})
+        s = stretch_signal(20, 24)
+        self.assertLess(s(p, self.N - 1, "DOWN"), 0.0)
+        # A monotonic ramp keeps price above its own lagging EMA throughout.
+        self.assertGreater(s(p, self.N - 1, "UP"), 0.0)
+
+    def test_equal_percentage_deviations_do_not_rank_equal(self):
+        """The reason this signal exists.
+
+        Both symbols sit about 5% below their own EMA, so a raw percentage
+        distance would call them a tie. The assertion is on the **magnitude**,
+        not just the ordering: the two EMAs differ slightly, so a bare
+        `assertLess(calm, wild)` still passes when the volatility division is
+        removed and the gap collapses from ~50x to ~0. That mutation shipped
+        through the first version of this test.
+        """
+        p = self._calm_and_wild()
+        s = stretch_signal(20, 24)
+        calm = s(p, self.N - 1, "CALM")
+        wild = s(p, self.N - 1, "WILD")
+        self.assertLess(calm, 0.0)
+        self.assertLess(wild, 0.0)
+
+        # Calm swings +-0.1% and wild +-5%, so the calm symbol's typical move is
+        # roughly fifty times smaller and its stretch should be correspondingly
+        # larger. 5x is a deliberately loose margin - it only has to be far
+        # enough from 1x to fail when the normalisation is gone.
+        self.assertGreater(
+            abs(calm), 5 * abs(wild),
+            "without dividing by the symbol's own volatility these two are "
+            "nearly equal, which is the failure this signal is built to avoid",
+        )
+
+    def test_a_gap_only_the_ema_window_sees_still_returns_none(self):
+        """`realized_vol` also rejects gaps, and its window usually contains the
+        EMA's - so the EMA-level guard is unobservable at the defaults. Making
+        the volatility window the *shorter* of the two is what isolates it."""
+        prices = [100.0 + math.sin(i * 0.3) for i in range(self.N)]
+        prices[self.N - 30] = None          # inside the EMA(40) window
+        p = make_panel(self.N, {"A": prices})
+        s = stretch_signal(40, 10)          # vol window [i-9, i] misses it
+        self.assertIsNone(s(p, self.N - 1, "A"))
+
+    def test_it_is_none_during_warmup(self):
+        """Warmup is `ema_period + 4 * ema_period`, not `ema_period`: the
+        recursion needs real history or the centre is just the seed."""
+        p = self._calm_and_wild()
+        s = stretch_signal(20, 24)
+        self.assertIsNone(s(p, 0, "CALM"))
+        self.assertIsNone(s(p, 24, "CALM"))
+        self.assertIsNone(s(p, 99, "CALM"))
+        self.assertIsNotNone(s(p, 120, "CALM"))
+
+    def test_a_gap_returns_none(self):
+        prices = [100.0 + math.sin(i * 0.3) for i in range(self.N)]
+        prices[self.N - 5] = None
+        p = make_panel(self.N, {"A": prices})
+        self.assertIsNone(stretch_signal(20, 24)(p, self.N - 1, "A"))
+
+    def test_a_flat_symbol_has_no_scale_and_returns_none(self):
+        """Zero volatility makes the normalisation undefined rather than
+        infinite - a division guard, not a stylistic preference."""
+        p = make_panel(self.N, {"FLAT": [100.0] * self.N})
+        self.assertIsNone(stretch_signal(20, 24)(p, self.N - 1, "FLAT"))
+
+    def test_degenerate_parameters_are_rejected(self):
+        for kw in ({"ema_period": 1}, {"vol_lookback": 1}, {"ema_period": 0}):
+            with self.subTest(kw=kw):
+                with self.assertRaises(CrossSectionError):
+                    stretch_signal(**kw)
+
+    def test_the_centre_is_an_ema_not_a_simple_mean(self):
+        """Checks the mid against a hand-computed recursive EMA over the same
+        span. A plain mean is a plausible substitution and passed every other
+        test here, because they are all about sign or ordering.
+
+        The span matters and this test found a real bug: `agent.indicators.ema`
+        *seeds* with the SMA of its first `period` inputs, so passing exactly
+        `period` values returns that seed and the recursion never runs - the
+        centre silently degrades to a simple mean while still looking fine.
+        Replicating the span here is what makes the two distinguishable.
+        """
+        prices = [100.0 + math.sin(i * 0.4) for i in range(self.N)]
+        p = make_panel(self.N, {"A": prices})
+        s = stretch_signal(20, 24)
+
+        span = 20 + 4 * 20
+        window = prices[self.N - span:self.N]
+        k = 2.0 / (20 + 1)
+        ema_val = sum(window[:20]) / 20          # the documented seed
+        for x in window[20:]:
+            ema_val = x * k + ema_val * (1 - k)
+
+        vol = realized_vol(24)(p, self.N - 1, "A")
+        expected = (prices[-1] - ema_val) / (vol * prices[-1])
+        self.assertAlmostEqual(s(p, self.N - 1, "A"), expected, places=9)
+
+        simple = (prices[-1] - sum(window[-20:]) / 20) / (vol * prices[-1])
+        self.assertNotAlmostEqual(
+            s(p, self.N - 1, "A"), simple, places=3,
+            msg="the centre collapsed to a simple mean",
+        )
+
+    def test_negate_flips_the_ranking(self):
+        """The mean-reversion reading needs `negate`; if that did not flip the
+        sign the two directions would be the same trade."""
+        p = self._calm_and_wild()
+        raw = stretch_signal(20, 24)
+        flipped = negate(raw)
+        i = self.N - 1
+        self.assertAlmostEqual(raw(p, i, "CALM"), -flipped(p, i, "CALM"), places=12)
 
 
 if __name__ == "__main__":

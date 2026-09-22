@@ -88,8 +88,15 @@ class NullSmartMoney:
 
 
 @dataclass
-class Trade:
-    """A completed round trip."""
+class ExecutedTrade:
+    """A completed round trip, in currency and wall-clock time.
+
+    Named `ExecutedTrade` rather than `Trade` because `trend_gate.Trade` is the
+    same concept in different units - bar indices and returns rather than
+    timestamps and dollars, with its own `exit_reason` vocabulary. Two classes
+    with one name meant a reader (or an import) could not tell which they had;
+    both now say what they are.
+    """
 
     symbol: str
     side: str
@@ -126,7 +133,7 @@ class BacktestResult:
     end_ms: int
     initial_equity: float
     final_equity: float
-    trades: list[Trade] = field(default_factory=list)
+    trades: list[ExecutedTrade] = field(default_factory=list)
     blocked: dict[str, int] = field(default_factory=dict)
     signals_seen: int = 0
     signals_actionable: int = 0
@@ -258,7 +265,7 @@ class Backtester:
 
         self.equity = initial_equity
         self.position: Position | None = None
-        self.trades: list[Trade] = []
+        self.trades: list[ExecutedTrade] = []
         self.blocked: dict[str, int] = {}
         self.equity_curve: list[tuple[int, float]] = []
         self.signals_seen = 0
@@ -303,7 +310,7 @@ class Backtester:
         if not times:
             raise RuntimeError(f"no bars available for {self.symbol}")
 
-        # Trade only inside the requested window; earlier bars are warmup for
+        # ExecutedTrade only inside the requested window; earlier bars are warmup for
         # indicators and must not generate orders.
         trade_start = self.datasets[self.symbol].start_ms
         started = False
@@ -551,7 +558,7 @@ class Backtester:
         net = gross - fees - funding
         self.equity += net
 
-        trade = Trade(
+        trade = ExecutedTrade(
             symbol=self.symbol,
             side=pos.side,
             entry_time=int(pos.opened_ts * 1000),
