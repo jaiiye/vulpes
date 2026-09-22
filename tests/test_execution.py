@@ -409,5 +409,300 @@ class TestSizingNotes(ExecutionTestCase):
             compute_size(market, self.cfg, "BTC", "long", 50_000.0, 0.0)
 
 
+class TestAttachProtection(ExecutionTestCase):
+    """The stop-loss path, which had no test at all - and it showed.
+
+    Two defects lived here at once. The venue call's rejection was never
+    checked, so a refused stop was journaled as `protection_placed` while the
+    position had nothing protecting it; and the journal call passed `kind=`,
+    which collides with `Journal.event(self, kind, **payload)` and raised a
+    TypeError on *every* call. The second masked the first - the operator saw a
+    message about the journal instead of the venue's actual reason.
+
+    These run against the real `Journal`, not a stand-in. The collision only
+    exists in the real signature, so a double would have gone on hiding it.
+    """
+
+    PLACED = {"response": {"data": {"statuses": [{"resting": {"oid": 11}}]}}}
+    REJECTED = {
+        "response": {"data": {"statuses": [{"error": "Order has invalid price."}]}}
+    }
+
+    def test_a_placed_order_is_journalled_without_raising(self):
+        """The TypeError regression: no protective order was ever recorded as
+        placed, because the bookkeeping raised after the venue accepted it."""
+        ex = FakeExchange(self.PLACED)
+        self.broker(exchange=ex)._attach_protection("BTC", "long", 0.001, 90_000.0, None)
+
+        placed = [e for e in self.events() if e["kind"] == "protection_placed"]
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0]["symbol"], "BTC")
+        self.assertEqual(placed[0]["trigger_px"], 90_000.0)
+
+    def test_which_protection_it_was_is_its_own_field(self):
+        """`kind` is the event's own name. Reusing it for the payload is exactly
+        what collided with the signature."""
+        ex = FakeExchange(self.PLACED)
+        self.broker(exchange=ex)._attach_protection("BTC", "long", 0.001, 90_000.0, 95_000.0)
+
+        placed = [e for e in self.events() if e["kind"] == "protection_placed"]
+        self.assertEqual([e["protection"] for e in placed], ["stop", "take_profit"])
+
+    def test_the_order_is_sent_reduce_only_as_a_sell(self):
+        """A protective order that could open a position is not a protective
+        order - it is a second way to lose money."""
+        ex = FakeExchange(self.PLACED)
+        self.broker(exchange=ex)._attach_protection("BTC", "long", 0.001, 90_000.0, None)
+
+        _, is_buy, _, _, order_type, reduce_only = ex.orders[0]
+        self.assertFalse(is_buy, "closing a long means selling")
+        self.assertTrue(reduce_only)
+        self.assertIn("trigger", order_type)
+
+    def test_a_rejected_order_is_not_reported_as_placed(self):
+        """The venue returns a rejection as a normal response, not as an
+        exception. Unchecked, the caller was told the position was protected
+        while nothing was on the book."""
+        ex = FakeExchange(self.REJECTED)
+        with self.assertRaises(ExecutionError):
+            self.broker(exchange=ex)._attach_protection("BTC", "long", 0.001, 90_000.0, None)
+
+        kinds = [e["kind"] for e in self.events()]
+        self.assertNotIn(
+            "protection_placed", kinds, "a rejected order was recorded as placed"
+        )
+        errors = [e for e in self.events() if e["kind"] == "error"]
+        self.assertTrue(errors, "a rejection must be journaled")
+        self.assertIn("unprotected", errors[0]["message"])
+
+    def test_the_rejection_reason_reaches_the_caller(self):
+        """The earlier code replaced the venue's reason with a TypeError about
+        the journal, which is what made this take a live order to find."""
+        ex = FakeExchange(self.REJECTED)
+        with self.assertRaises(ExecutionError) as ctx:
+            self.broker(exchange=ex)._attach_protection("BTC", "long", 0.001, 90_000.0, 95_000.0)
+
+        message = str(ctx.exception)
+        self.assertIn("invalid price", message)
+        self.assertIn("stop", message)
+        self.assertNotIn("Journal.event", message)
+
+    def test_a_journal_failure_does_not_claim_the_position_is_unprotected(self):
+        """By the time the journal is written the order IS on the venue, so a
+        bookkeeping error must not send the caller to unwind a position that is
+        in fact protected."""
+        ex = FakeExchange(self.PLACED)
+        broker = self.broker(exchange=ex)
+        broker.journal.event = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("disk full")
+        )
+
+        with self.assertRaises(RuntimeError):
+            broker._attach_protection("BTC", "long", 0.001, 90_000.0, None)
+        self.assertEqual(len(ex.orders), 1, "the order should still have been sent")
+
+
+class PriceRuleFakeExchange(FakeExchange):
+    """A fake that enforces the venue's price format.
+
+    `FakeExchange` echoes whatever it is handed, which is precisely why a
+    rounding bug shipped: a double cannot enforce a rule it was never taught,
+    and this rule belongs to the venue. This one implements the documented perp
+    rule - at most 5 significant figures and at most `6 - szDecimals` decimals -
+    and rejects the way the venue does: as a normal response, not an exception.
+    """
+
+    def __init__(self, sz_decimals: int, **kw):
+        super().__init__(**kw)
+        self.sz_decimals = sz_decimals
+        self.rejected_prices: list[float] = []
+
+    def accepts(self, px: float) -> bool:
+        if px <= 0:
+            return False
+        return float(px) == round(float(f"{px:.5g}"), max(0, 6 - self.sz_decimals))
+
+    def order(self, symbol, is_buy, size, px, order_type, reduce_only=False):
+        if not self.accepts(px):
+            self.rejected_prices.append(px)
+            return {
+                "response": {"data": {"statuses": [{"error": "Order has invalid price."}]}}
+            }
+        return super().order(symbol, is_buy, size, px, order_type, reduce_only)
+
+
+class TestPriceRounding(ExecutionTestCase):
+    """Prices must be rounded or the venue refuses them.
+
+    Found by placing a real testnet order - the first this project ever sent.
+    `price * (1 + 5bp)` reached the venue as `86677.81725`, ten significant
+    figures against a limit of five, and came back `Order has invalid price.`
+    Every limit order and every protective order was being refused.
+
+    No test in the suite could have caught it, because `FakeExchange` accepts
+    any float. `PriceRuleFakeExchange` above is the fake that would have.
+    """
+
+    #: The exact prices the first live order was built from: the observed mid,
+    #: and `mid * (1 + 5bp)` - the ten-significant-figure value the venue
+    #: refused with `Order has invalid price.`
+    LIVE_MID = 86_634.5
+    LIVE_REJECTED = 86_677.81725
+
+    def test_the_live_rejected_price_rounds_to_the_accepted_one(self):
+        """Pinned to the number the venue actually accepted in the live test."""
+        self.assertEqual(self.broker()._round_price("BTC", self.LIVE_REJECTED), 86678.0)
+
+    def test_five_significant_figures_and_sz_decimals_both_hold(self):
+        broker = self.broker()
+        broker._sz_decimals["BTC"] = 5      # 6 - 5 = 1 decimal
+        rounded = broker._round_price("BTC", 123456.789)
+        self.assertEqual(rounded, 123460.0)
+
+        broker._sz_decimals["TINY"] = 0     # 6 decimals
+        self.assertEqual(broker._round_price("TINY", 0.01234567), 0.012346)
+
+    def test_it_matches_the_sdk_s_market_order_rounding(self):
+        """Both sides must agree, or a limit order and a market order for the
+        same intent would sit at different prices."""
+        broker = self.broker()
+        for price in (86677.81725, 1234.56789, 0.0123456789, 99999.99):
+            with self.subTest(price=price):
+                self.assertEqual(
+                    broker._round_price("BTC", price),
+                    round(float(f"{price:.5g}"), max(0, 6 - broker.SIZE_DECIMALS)),
+                )
+
+    def test_a_non_positive_price_is_refused(self):
+        for bad in (0.0, -1.0):
+            with self.subTest(price=bad):
+                with self.assertRaises(ExecutionError):
+                    self.broker()._round_price("BTC", bad)
+
+    def test_a_limit_order_reaches_the_venue_rounded(self):
+        """End to end through `open_position`, reproducing the live case: the
+        mid it was given produces `mid * (1 + 5bp)` = `86677.81725`, which is
+        what the venue refused."""
+        ex = PriceRuleFakeExchange(sz_decimals=5, order_result=filled(0.001, 86_678.0))
+        broker = self.broker(exchange=ex)
+        broker._sz_decimals["BTC"] = 5
+        broker.open_position("BTC", "long", 0.001, self.LIVE_MID, 3)
+
+        # Without the rounding this list holds 86677.81725 and the order is
+        # refused, which is what happened on the live account.
+        self.assertEqual(ex.rejected_prices, [], "the venue refused the limit price")
+        self.assertEqual(ex.orders[0][3], 86_678.0)
+
+    def test_a_trigger_price_reaches_the_venue_rounded(self):
+        """The stop is sent twice - as the order price and as `triggerPx` - and
+        the venue validates both."""
+        ex = PriceRuleFakeExchange(sz_decimals=5, order_result=resting(11))
+        broker = self.broker(exchange=ex)
+        broker._sz_decimals["BTC"] = 5
+        trigger = self.LIVE_REJECTED * 0.98
+        broker._attach_protection("BTC", "long", 0.001, trigger, None)
+
+        self.assertEqual(ex.rejected_prices, [], "the venue refused the trigger price")
+        _, _, _, px, order_type, _ = ex.orders[0]
+        self.assertEqual(px, round(float(f"{trigger:.5g}"), 1))
+        self.assertIn("trigger", order_type)
+        self.assertEqual(order_type["trigger"]["triggerPx"], px)
+
+
+class FakeAccountInfo:
+    """The three reads `account_equity` needs, scripted."""
+
+    def __init__(self, perp_value=0.0, spot_usdc=0.0,
+                 abstraction="unifiedAccount", abstraction_raises=False,
+                 spot_coins=("USDC",)):
+        self.perp_value = perp_value
+        self.spot_usdc = spot_usdc
+        self.abstraction = abstraction
+        self.abstraction_raises = abstraction_raises
+        self.spot_coins = spot_coins
+
+    def user_state(self, address):
+        return {
+            "marginSummary": {"accountValue": str(self.perp_value)},
+            "assetPositions": [],
+        }
+
+    def spot_user_state(self, address):
+        return {
+            "balances": [
+                {"coin": c, "total": str(self.spot_usdc)} for c in self.spot_coins
+            ]
+        }
+
+    def post(self, path, payload):
+        if self.abstraction_raises:
+            raise RuntimeError("endpoint not supported")
+        return self.abstraction
+
+
+class TestAccountEquity(ExecutionTestCase):
+    """Equity has to be right: every position size is derived from it.
+
+    Found by trying to trade a funded account. It reported $0.00 and refused
+    every order with "account equity is zero; cannot size a position", while the
+    account held 999 USDC and the venue accepted market orders - so the money
+    was there and the reading was wrong.
+    """
+
+    def _broker(self, info):
+        # A non-None `_exchange` is all `_ensure_sdk` checks, so the fake info
+        # is used as-is and nothing touches the network.
+        broker = self.broker(exchange=object())
+        broker._info = info
+        broker._account_address = "0xacct"
+        return broker
+
+    def test_a_unified_account_is_read_from_spot(self):
+        info = FakeAccountInfo(perp_value=0.0, spot_usdc=998.8)
+        self.assertAlmostEqual(self._broker(info).account_equity(), 998.8)
+
+    def test_a_classic_account_is_still_read_from_the_perp_summary(self):
+        info = FakeAccountInfo(perp_value=500.0, spot_usdc=998.8, abstraction="default")
+        self.assertAlmostEqual(self._broker(info).account_equity(), 500.0)
+
+    def test_a_unified_account_with_a_position_open_still_reads_spot(self):
+        """`accountValue` turns non-zero while a position is open - it tracked
+        margin, not the balance - so keying off the *value* instead of the
+        account mode would size the next trade on about $5."""
+        info = FakeAccountInfo(perp_value=5.20, spot_usdc=998.8)
+        self.assertAlmostEqual(self._broker(info).account_equity(), 998.8)
+
+    def test_an_unreadable_mode_keeps_the_previous_behaviour(self):
+        """Inventing a number is worse than reporting what the perp summary
+        said; an older venue may not have the endpoint at all."""
+        info = FakeAccountInfo(perp_value=42.0, spot_usdc=998.8, abstraction_raises=True)
+        self.assertAlmostEqual(self._broker(info).account_equity(), 42.0)
+
+    def test_spot_holding_no_usdc_reports_zero_rather_than_a_guess(self):
+        info = FakeAccountInfo(perp_value=0.0, spot_usdc=123.0, spot_coins=("HYPE",))
+        self.assertAlmostEqual(self._broker(info).account_equity(), 0.0)
+
+    def test_dry_run_is_unaffected(self):
+        import os as _os
+
+        broker = self._broker(FakeAccountInfo(perp_value=0.0, spot_usdc=998.8))
+        broker.dry_run = True
+        expected = float(_os.getenv("DRY_RUN_EQUITY_USD", 1000.0))
+        self.assertAlmostEqual(broker.account_equity(), expected)
+
+    def test_sizing_over_a_unified_account_now_produces_a_position(self):
+        """The end that matters: `compute_size` refused this outright before,
+        so the bot could not place a single order on this account type."""
+        broker = self._broker(FakeAccountInfo(perp_value=0.0, spot_usdc=1000.0))
+        result = compute_size(None, self.cfg, "BTC", "long", 50_000.0, broker.account_equity())
+        self.assertGreater(result.notional, 0)
+
+    def test_the_same_sizing_still_refuses_a_genuinely_empty_account(self):
+        """The fix must not turn "no money" into a tradeable number."""
+        broker = self._broker(FakeAccountInfo(perp_value=0.0, spot_usdc=0.0))
+        with self.assertRaises(ExecutionError):
+            compute_size(None, self.cfg, "BTC", "long", 50_000.0, broker.account_equity())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

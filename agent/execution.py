@@ -528,6 +528,35 @@ class Broker:
         factor = 10 ** decimals
         return round(size * factor) / factor
 
+    def _round_price(self, symbol: str, price: float) -> float:
+        """Round `price` to what the venue will accept.
+
+        Perp prices carry at most 5 significant figures and at most
+        `6 - szDecimals` decimals. **`Exchange.order()` does not apply this** -
+        only the SDK's own `market_open`/`market_close` do, inside
+        `_slippage_price`. So a limit price or a trigger price computed here
+        reached the venue raw and came back as `Order has invalid price.`
+
+        Not a theoretical concern: the first live testnet order this project
+        ever placed was rejected for exactly this, at
+        `price * (1 + limit_offset_bps/10000)` = `86677.81725` - ten significant
+        figures against a limit of five. No test could have caught it, because
+        the suite's fake exchange accepts any float; only the venue knows its
+        own formatting rules, which is why this needed a real order to surface.
+
+        The expression mirrors the SDK's `_slippage_price` on purpose rather
+        than reimplementing the rule: two roundings that disagreed would put
+        the bot's limit orders and the SDK's market orders at different prices
+        for the same intent.
+        """
+        if price <= 0:
+            raise ExecutionError(f"invalid price {price} for {symbol}")
+        decimals = self._sz_decimals.get(symbol.upper(), self.SIZE_DECIMALS)
+        # `max(0, ...)`: a negative decimal count would round to tens, which is
+        # never what a price needs. The SDK has no such guard, but a venue
+        # `szDecimals` above 6 would mean the metadata is wrong, not the price.
+        return round(float(f"{price:.5g}"), max(0, 6 - decimals))
+
     # ------------------------------------------------------------------
     # Account
     # ------------------------------------------------------------------
@@ -542,9 +571,59 @@ class Broker:
         )
         try:
             state = self._info.user_state(address)
-            return float(state["marginSummary"]["accountValue"])
+            perp_value = float(state["marginSummary"]["accountValue"])
         except Exception as exc:  # noqa: BLE001
             raise ExecutionError(f"could not read account equity: {exc}") from exc
+
+        # A unified account keeps its collateral in the SPOT balance and reports
+        # `accountValue` as 0 whenever it is flat. Reading the perp summary alone
+        # therefore told a funded account it had nothing, and `compute_size`
+        # refused every trade with "account equity is zero; cannot size a
+        # position" - which is exactly what happened on the first live testnet
+        # run, while the account could and did trade.
+        #
+        # Measured on that account, flat and then with a position:
+        #     flat       accountValue 0.0000   spot 998.8869
+        #     in a trade accountValue 5.2015   spot 998.8774  (spot barely moves)
+        #     closed     accountValue 0.0000   spot 998.8600  (the loss came
+        #                                                      out of spot)
+        # So for this account type the spot balance IS the collateral, and the
+        # realised PnL of every round trip lands in it. Unrealised PnL is
+        # deliberately not added: its composition in `accountValue` is not
+        # something I could establish from measurement, and a position size
+        # built on a figure I cannot explain is worse than one that is slightly
+        # conservative. Sizing happens while flat, where the two coincide.
+        if self.is_unified_account(address):
+            return self._spot_usdc(address)
+        return perp_value
+
+    def is_unified_account(self, address: str | None = None) -> bool:
+        """Whether spot and perp share one balance on this account.
+
+        `userAbstraction` answers this directly. The alternative was inferring
+        it from the shape of the balances, and a guess here becomes a wrong
+        position size. Unreadable answers False, i.e. keep the previous
+        behaviour rather than invent a number.
+        """
+        address = address or self._account_address
+        if not address:
+            return False
+        try:
+            mode = self._info.post(
+                "/info", {"type": "userAbstraction", "user": address}
+            )
+        except Exception:  # noqa: BLE001 - an old venue may not have the endpoint
+            return False
+        return str(mode).strip().strip('"') == "unifiedAccount"
+
+    def _spot_usdc(self, address: str) -> float:
+        """USDC held in the spot balance, which is where a unified account's
+        collateral actually sits."""
+        state = self._info.spot_user_state(address)
+        for balance in state.get("balances") or []:
+            if str(balance.get("coin", "")).upper() == "USDC":
+                return float(balance.get("total", 0) or 0)
+        return 0.0
 
     # ------------------------------------------------------------------
     # Orders
@@ -597,7 +676,11 @@ class Broker:
             order_type = self.cfg.execution.order_type
             if order_type == "limit":
                 offset = self.cfg.execution.limit_offset_bps / 10_000.0
-                limit_px = price * (1 + offset) if is_buy else price * (1 - offset)
+                # Rounded, or the venue refuses it: `Exchange.order()` applies
+                # no formatting rule of its own. See `_round_price`.
+                limit_px = self._round_price(
+                    symbol, price * (1 + offset) if is_buy else price * (1 - offset)
+                )
                 result = self._exchange.order(
                     symbol, is_buy, size, limit_px, {"limit": {"tif": "Gtc"}}
                 )
@@ -967,17 +1050,20 @@ class Broker:
         for label, trigger in (("stop", stop_price), ("take_profit", take_profit_price)):
             if trigger is None:
                 continue
+            # The trigger is used BOTH as the order price and as `triggerPx`, and
+            # the venue validates both - so rounding it once here covers both.
+            trigger = self._round_price(symbol, trigger)
+
+            # The venue call is in its own `try` so the result check below cannot
+            # be swallowed and re-wrapped by the transport handler.
             try:
-                self._exchange.order(
+                result = self._exchange.order(
                     symbol,
                     close_is_buy,
                     size,
                     trigger,
                     {"trigger": {"triggerPx": trigger, "isMarket": True, "tpsl": "sl" if label == "stop" else "tp"}},
                     reduce_only=True,
-                )
-                self.journal.event(
-                    "protection_placed", symbol=symbol, kind=label, trigger_px=trigger
                 )
             except Exception as exc:  # noqa: BLE001
                 # Loud, and the caller decides whether to unwind.
@@ -991,6 +1077,40 @@ class Broker:
                 raise ExecutionError(
                     f"could not attach {label} order for {symbol}: {exc}"
                 ) from exc
+
+            # `order()` does NOT raise when the venue rejects an order - it
+            # returns a status whose first element is `{"error": ...}`. The entry
+            # path checks that via `_parse_order_result`; this path did not, so a
+            # rejected stop would have been journaled as `protection_placed` and
+            # the caller told the position was protected.
+            #
+            # That was hidden by the second bug this fixes: the journal call used
+            # to pass `kind=label`, which collides with
+            # `Journal.event(self, kind, **payload)` and raised before anything
+            # was written. Renaming the field alone would have replaced a loud
+            # TypeError with a silent success, which is strictly worse.
+            state, _, _ = self._parse_order_result(result)
+            if state == "error":
+                note = (
+                    f"the venue rejected the {label} for {symbol} at {trigger}: "
+                    f"{result}"
+                )
+                self.journal.event(
+                    "error", message=f"{note}. Position is unprotected."
+                )
+                raise ExecutionError(note)
+
+            # Journaled outside the `try`: if this write fails the order IS on
+            # the venue, so the caller must not be told the position is
+            # unprotected and unwind a position that is in fact protected.
+            # (`protection`, not `kind` - see above.)
+            self.journal.event(
+                "protection_placed",
+                symbol=symbol,
+                protection=label,
+                trigger_px=trigger,
+                result=result,
+            )
 
     def close_position(self, position: Position, price: float, reason: str) -> float:
         """Close a position and return the realised PnL.

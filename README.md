@@ -75,7 +75,7 @@ backtest/                   研究与回测（不参与实盘）
   whale_history.py          从资金费记录重建历史鲸鱼持仓
   historical_smart_money.py 用重建的鲸鱼历史服务聪明钱因子
   position_history.py       持仓历史的落盘与读取
-tests/                      853 个离线测试，16 个文件
+tests/                      885 个离线测试，16 个文件
 ```
 
 **成交时点只有一份实现**（`trend_gate.simulate_flags`），四个信号模块都复用它。
@@ -326,7 +326,7 @@ use_hyperfeed: true
 python -m unittest discover -s tests -v
 ```
 
-853 个离线测试，覆盖：指标数值正确性、因子打分方向、置信度加权与权重再分配、
+885 个离线测试，覆盖：指标数值正确性、因子打分方向、置信度加权与权重再分配、
 数据规范化（推导公式、符号归属、跨来源一致性、费用模型、列裁剪比例、同步规划）、
 历史仓位重建（陈旧窗口、未实现盈亏可用性、引擎警告准确性）、
 排行榜重建（排名依据、封顶次序、缓存失效、窗口覆盖度、SQL 传输方式、活跃度上限）、
@@ -3877,6 +3877,103 @@ python record_snapshots.py --summary      # 查看已积累的覆盖度
 
 仍未验证：真实下单（EIP-712 签名、订单回执、成交落库）、`reconcile` 重启对账、
 `has_protective_orders` 是否真的挂着止损单、断线重连 —— **这些都需要 API 钱包私钥**。
+
+---
+
+## 第七轮审查：实盘下单路径（三个 bug，都是「一张单都下不出去」级别）
+
+第一次把订单真的发到交易所（测试网）时暴露的。**三个都只在真实下单时才会出现**，
+865 条测试全绿也照样存在：
+
+| # | 缺陷 | 后果 |
+|---|---|---|
+| **A** | `limit_px` / `triggerPx` **没有取整** | 每一张限价单、每一张止损单都被拒 |
+| **B** | 统一账户下 `account_equity()` 读出 **$0.00** | `compute_size` 拒绝，**无法计算头寸** |
+| **C** | `_attach_protection` 的 `journal.event(..., kind=label)` 与 `Journal.event(self, kind, ...)` 签名撞车 | **止损路径必然抛错，且日志说谎** |
+
+### A：价格必须取整
+
+`agent/execution.py` 算了 `price * (1 ± limit_offset_bps/10000)` 就直传交易所。
+数量有取整（`_round_size`），**价格没有**。实盘复现：
+
+```
+bot 表达式 86677.81725（10 位有效数字，上限 5） -> Order has invalid price.
+取整后     86678.0                              -> 接受
+```
+
+`Exchange.order()` 自己**不做**任何格式化 —— 只有 SDK 的 `market_open`/`market_close`
+在 `_slippage_price` 里做了。所以市价路径一直是好的，而限价与触发价路径一直是坏的。
+
+修法用 `_round_price`，**镜像 SDK 的表达式**而不是重新发明规则（两套取整若不一致，
+同一个意图的限价单和市价单会落在不同价格上）。
+
+### B：统一账户把抵押品放在现货
+
+这个账户是 `userAbstraction = unifiedAccount`。读 perp 的 `marginSummary.accountValue`
+拿到 0，而钱在现货：
+
+```
+平坦时   accountValue 0.0000   现货 998.8869
+持仓中   accountValue 5.2015   现货 998.8774   ← 现货几乎不动
+平仓后   accountValue 0.0000   现货 998.8600   ← 已实现盈亏从现货扣
+```
+
+**账户模式是可查询的**（`{"type":"userAbstraction","user":...}`），所以按模式判断，
+不靠猜余额形状 —— 一个猜错就是错的头寸大小。读不到时**保留原行为**，不发明数字。
+未实现盈亏刻意不加：`accountValue` 的构成我没能从测量中确定，而**基于一个我解释不了
+的数字去算仓位，比略微保守更糟**。
+
+### C：止损路径从来没跑通过，而且日志写反了
+
+```python
+def event(self, kind: str, **payload): ...           # Journal
+journal.event("protection_placed", kind=label, ...)  # _attach_protection
+# -> TypeError: got multiple values for argument 'kind'
+```
+
+而且它**掩盖了 A**：价格被拒时操作员看到的是一句关于 `Journal.event()` 的报错。
+
+现场证据（取整后的触发价，所以 A 已被排除）：
+
+```
+_attach_protection  -> 抛 ExecutionError
+交易所上真实的挂单   -> [(60752765753, '84884.0')]        ← 单挂上了
+has_protective_orders -> True
+journal 记的是       -> "FAILED to attach stop ... Position is unprotected."
+                                                       ↑↑ 这句是假的
+```
+
+修 **C 时必须同时补上被拒检查**，否则只是把「大声报错」换成「静默假成功」：
+`Exchange.order()` 对**被拒绝**的订单**不抛异常**，它正常返回
+`{"status":"ok","response":{"data":{"statuses":[{"error": ...}]}}}`。入场路径用
+`_parse_order_result` 检查了，保护路径没有。
+
+### 为什么 865 条测试全都没抓到
+
+| 缺陷 | 为什么漏掉 |
+|---|---|
+| A | 测试用**假交易所**，它接受任何浮点数 —— 假对象无法执行一条它没被告知的场所规则 |
+| B | 没有测试构造过「`accountValue=0` 但现货有钱」的账户 |
+| C | **`_attach_protection` 零测试覆盖**。而测试用的是**真的 `Journal`**，所以只要有一次测试走到那条路径就会暴露 |
+
+所以补的测试里，`PriceRuleFakeExchange` 是**会校验价格格式的假交易所** ——
+它是本该存在的那个假对象。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| 测试 | **885 通过**（新增 20 条） |
+| 变异 | **A 6/6、C 4/4、B 6/6** 全部捕获（含三个原始 bug 本身） |
+| 主网 / 回测行为 | 不变（`_round_price` 只在实盘下单路径；统一账户分支只在 `unifiedAccount` 下走） |
+| 真实测试网端到端 | 权益 `$0.00 → $998.80`；限价单**成交** `long 0.00116 BTC @ 86418.0`；止损**挂上** `oid 60753676934 @ 83826.0`；`has_protective_orders=True`；journal 记 `protection_placed` |
+
+### 顺带发现
+
+- **最小下单金额 $10**：`0.0001 BTC` 被拒（`Order must have minimum value of $10`）。
+  小账户按 `account_allocation_pct` 算出的名义额可能卡在这条线以下。
+- **测试网端点会抖**：过程中真实出现过两次 SSL 中断（`UNEXPECTED_EOF`），
+  重试即恢复。生产上需要留意重试预算。
 
 ---
 
