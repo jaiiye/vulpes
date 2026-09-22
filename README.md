@@ -75,7 +75,7 @@ backtest/                   研究与回测（不参与实盘）
   whale_history.py          从资金费记录重建历史鲸鱼持仓
   historical_smart_money.py 用重建的鲸鱼历史服务聪明钱因子
   position_history.py       持仓历史的落盘与读取
-tests/                      898 个离线测试，16 个文件
+tests/                      915 个离线测试，16 个文件
 ```
 
 **成交时点只有一份实现**（`trend_gate.simulate_flags`），四个信号模块都复用它。
@@ -326,7 +326,7 @@ use_hyperfeed: true
 python -m unittest discover -s tests -v
 ```
 
-898 个离线测试，覆盖：指标数值正确性、因子打分方向、置信度加权与权重再分配、
+915 个离线测试，覆盖：指标数值正确性、因子打分方向、置信度加权与权重再分配、
 数据规范化（推导公式、符号归属、跨来源一致性、费用模型、列裁剪比例、同步规划）、
 历史仓位重建（陈旧窗口、未实现盈亏可用性、引擎警告准确性）、
 排行榜重建（排名依据、封顶次序、缓存失效、窗口覆盖度、SQL 传输方式、活跃度上限）、
@@ -429,7 +429,7 @@ python -m unittest discover -s tests -v
 是默认配置，所以这是默认路径。
 
 **根因是测试覆盖为零**：`resting` / `_last_order_id` / `_cancel_order` 一个测试都没有，
-所以 204 个测试全绿也没抓到。现已补 `tests/test_execution.py`（26 个用例）覆盖
+所以 204 个测试全绿也没抓到。现已补 `tests/test_execution.py`（67 个用例）覆盖
 整条挂单生命周期。
 
 修复后语义更严格：**只有交易所状态确认撤销，才报告为已撤销**；
@@ -3972,6 +3972,7 @@ journal 记的是       -> "FAILED to attach stop ... Position is unprotected."
 
 - **最小下单金额 $10**：`0.0001 BTC` 被拒（`Order must have minimum value of $10`）。
   小账户按 `account_allocation_pct` 算出的名义额可能卡在这条线以下。
+  **第九轮**把它做了检查，并实测出这条规则的形状（豁免的是 trigger 单，不是 `reduce_only`）。
 - **测试网端点会抖**：过程中真实出现过两次 SSL 中断（`UNEXPECTED_EOF`），
   重试即恢复。生产上需要留意重试预算。
 
@@ -4076,6 +4077,94 @@ run():            except CriticalExecutionError <- 也接不住；而它的逐�
 
 （顺带排除一个怀疑：我一度以为 `check_volume` 拿未收盘的 bar 去比完整 bar 的平均，
 会系统性拒绝入场 —— `safe_candles` 里确实调用了 `_drop_incomplete`，**该怀疑不成立**。）
+
+---
+
+## 第九轮：三条「拒绝」路径（其中一条伪装成成功）
+
+起点是第七轮留下的那条脚注 ——「`0.0001 BTC` 被拒，小账户可能卡在这条线以下」。
+把它做成检查之前，先得知道规则的**形状**，而脚注只有一个单侧观察。
+
+### 实测场所规则（测试网，BTC）
+
+| 单型 | 名义 | 结果 |
+|---|---|---|
+| 入场 | $9.54 | 拒绝 `Order must have minimum value of $10. asset=3` |
+| 入场 | $10.40 | 接受 |
+| reduce-only **trigger**（止损） | $9.03 | **接受** |
+| reduce-only **市价**（`market_close`） | $5.21 | **拒绝** |
+| reduce-only 市价（全平） | $10.41 | 接受 |
+
+豁免的是 **trigger 单这个形态，不是 `reduce_only`** —— 与直觉相反，而且直接决定修法：
+入场阈值**不需要**为保护单留余量（留了会拒掉本来能成的交易），但**平仓路径受同一条限制**。
+
+另外两条实测：被拒的 reduce-only 市价单**不会部分成交**（$5.21 那单被拒后持仓一字未动）；
+精确边界**测不出来**，因为 BTC 的尺寸步长是 `0.00001` = $0.87，比 `[$9.54, $10.40]`
+这个区间还宽 —— 所以 `>= $10` 采用的是场所自己的措辞，并在测试里显式钉住，
+而不是让一个 `<` 隐含决定。
+
+### 缺陷一：入场会发一张注定被拒的单
+
+`compute_size` 算出 $8.42 名义 → 打印 `ENTER` → 下单 → 被拒 → 记 `ORDER FAILED`。
+链路是优雅的（清空持仓、不污染护栏），但**每个信号都白跑一个来回**，而且日志里没有任何
+算式说明「是账户太小」，读起来像集成坏了。
+
+`MIN_ORDER_NOTIONAL_USD` + `Broker._reject_small_order`：在发单**之前**、按场所实际会看到的
+价格判（限价单带 offset、市价单是 `price`），并且**干跑同样执行** —— 否则模拟会报告一个
+实盘拒绝的入场，而那正是干跑唯一不该出错的地方。
+
+预检位于 `_ensure_sdk()` **之前**，所以这条拒绝**不需要凭据、也不需要网络**
+（实测：把私钥从环境里删掉，拒绝完全一样）。
+
+### 缺陷二：被拒的平仓被当成平掉了
+
+`Exchange.market_close()` 被拒时**不抛异常**，只返回 `{"error": ...}` 状态 —— 这条规则
+`_attach_protection` 早就写在文档里并处理了，**两个平仓调用点都没有**：
+
+- `close_position` 记 `close_placed` 并返回 PnL，于是 `bot.close_position` 清空
+  `self.position`、把**编造的** PnL 加进统计并喂给 `discipline.record_outcome` ——
+  agent 丢掉了自己仍然持有的敞口，护栏里还多了一个不存在的结果
+- `_unwind_unprotected` 记 `unwound_unprotected` 并返回**可恢复**错误，于是 agent 带着一个
+  没保护、没平掉的持仓继续跑，而 `on_unprotected`（要求人工介入的那条通道）**从未被调用**
+
+`_market_close_confirmed` 统一处理：市价单**没有合法的 resting 状态**，所以它要求**成交**，
+而不只是「没有 error」；未确认就抛，两个调用方都已按「继续跟踪 + 交由对账」的方式处理。
+
+### 缺陷三：首次下单的尺寸被用错了小数位
+
+真实下单时撞到 `order rejected: 0.0` —— 连错在哪都不知道，因为 `_parse_order_result`
+在 error 分支返回 `("error", 0.0, 0.0)`，而调用方打印的是那个价格。把场所原文取出来才看清：
+**`Order has invalid size.`**
+
+根因：`_round_size` 按 `self._sz_decimals` 取整，那份缓存由 `_ensure_sdk` 从场所元数据填充，
+**但取整在它之前跑** —— 所以启动后**第一张**实盘单会用回退的 6 位小数：
+
+```
+0.000121 BTC（按 6 位取整）        -> {'error': 'Order has invalid size.'}
+0.00012  BTC（BTC 的 szDecimals=5）-> 成交
+```
+
+这是**既有代码**（不是本轮引入），但它的两个后果都落在本轮：opaque 的日志，和一张注定被拒的单。
+
+修法：SDK 初始化提到取整之前（`_ensure_sdk` 幂等；干跑不建客户端、保留回退值），
+外加 `_order_error` 把场所原文接回消息 —— `Order has invalid size.` 与
+`Order must have minimum value of $10.` 要改的东西完全不同，而日志此前分不出它们。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| 测试 | **915 通过**（新增 17 条） |
+| 变异 | **8/8** 捕获（含三处原始缺陷本身、以及「SDK 初始化挪到取整之后」） |
+| 测试网端到端 | 低于下限：拒绝且 **journal 为空**（一张单都没发出去）；复现之前失败那单：**成交 `0.00012 @ 86,850`**；平仓 `close_placed`；收尾 持仓 0 / 挂单 0 |
+| 主网 / 回测 | 不变（预检在实盘与干跑都会触发，但主网权益远高于下限；回测不走 `Broker`） |
+
+测试夹具新增 `MinValueFakeExchange` —— **会按场所规则拒绝的假交易所**，拒绝方式与场所一致
+（正常返回值、不抛异常），且豁免只给 trigger 单。理由与 `PriceRuleFakeExchange` 相同：
+假对象无法执行一条它没被告知的场所规则。
+
+另修一处夹具缺陷：`FakeExchange.market_close` 返回 `{"status": "ok"}`，而场所从不返回这个形状 ——
+`_market_close_confirmed` 开始读它之后，这个形状会让**每一次平仓**都变成「未确认」。
 
 ---
 

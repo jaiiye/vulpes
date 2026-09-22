@@ -40,6 +40,24 @@ TAKER_FEE_RATE = 0.00035
 # and slippage dominate" rule.
 SMALL_NOTIONAL_USD = 1_000.0
 
+# The venue's minimum order value. Hyperliquid refuses anything below it with
+# `Order must have minimum value of $10. asset=N`, and the rule is the number
+# in that message.
+#
+# Measured on testnet, because it is narrower than "orders need $10". The
+# exemption is for *trigger* orders, not for `reduce_only`:
+#     entry             $  9.54   refused
+#     entry             $ 10.40   accepted
+#     reduce-only stop  $  9.03   accepted   <- trigger, exempt
+#     reduce-only close $  5.21   refused    <- market, NOT exempt
+#     reduce-only close $ 10.41   accepted
+# The venue's size quantum on BTC is 0.00001 = $0.87 at $87k, wider than the
+# remaining uncertainty about where between 9.54 and 10.40 the line sits.
+#
+# Where it is enforced, and why, is in `Broker._reject_small_order` and
+# `Broker._market_close_confirmed`.
+MIN_ORDER_NOTIONAL_USD = 10.0
+
 
 class ExecutionError(RuntimeError):
     """A recoverable execution problem. The loop logs it and continues."""
@@ -682,6 +700,36 @@ class Broker:
                 return float(balance.get("total", 0) or 0)
         return 0.0
 
+    def _reject_small_order(self, symbol: str, size: float, order_price: float) -> None:
+        """Refuse to send an entry the venue would refuse for being too small.
+
+        Checked here, before anything is sent, rather than left to the venue's
+        rejection. The rejection arrives as an opaque string -
+        `order rejected: 'Order must have minimum value of $10. asset=3'` -
+        that gets journalled as a generic entry failure, so a small account
+        logs `ENTER ...` and then `ORDER FAILED` on every signal without ever
+        being told that the cause is its size. A round trip to learn something
+        already known is also just waste.
+
+        Deliberately NOT applied to the protective orders. They are exempt from
+        the minimum (measured: a $9.03 reduce-only stop was accepted where a
+        $5.21 reduce-only market close was refused), so requiring them to clear
+        it would refuse entries that work.
+
+        `size` must already be rounded and `order_price` the price the venue
+        will see: the rule is on the order's value, so both halves matter.
+        """
+        value = size * order_price
+        if value >= MIN_ORDER_NOTIONAL_USD:
+            return
+        raise ExecutionError(
+            f"{symbol}: entry of {size:.6g} at {order_price:,.6g} is worth "
+            f"${value:,.2f}, below the venue's ${MIN_ORDER_NOTIONAL_USD:,.0f} "
+            "minimum order value; the order was not sent. Raise "
+            "account_allocation_pct, the risk budget, or the account size to "
+            "trade this symbol."
+        )
+
     # ------------------------------------------------------------------
     # Orders
     # ------------------------------------------------------------------
@@ -700,12 +748,39 @@ class Broker:
         trailing_activation: float = 0.0,
     ) -> Position:
         """Open a position, reducing any opposite exposure first."""
+        # The SDK comes first because `_round_size` needs `szDecimals`, which
+        # `_ensure_sdk` caches from the venue's own metadata. Rounding before
+        # that used the fallback of 6 decimals, so the FIRST live order after
+        # startup could carry a size the venue cannot represent - measured,
+        # `0.000121` BTC against `szDecimals = 5` came back `Order has invalid
+        # size.`, and the message the agent logged was `order rejected: 0.0`.
+        # A dry run needs no SDK and sends nothing, so it keeps the fallback.
+        if not self.dry_run:
+            self._ensure_sdk()
+
         size = self._round_size(symbol, size)
         if size <= 0:
             raise ExecutionError(f"computed size for {symbol} rounds to zero")
 
         is_buy = side == LONG
         notional = size * price
+
+        # Checked for dry runs too. The constraint belongs to the venue, so a
+        # simulation that skipped it would report an entry the live path
+        # refuses - which is the one thing a dry run must not do.
+        #
+        # Valued at the order's own price, not `price`: a limit order carries
+        # the offset and a market order the SDK's slippage. The offset is exact
+        # here; the slippage is not modelled and moves the value by
+        # `slippage_bps`, a few bp against the venue's $0.87 size quantum.
+        offset = (
+            self.cfg.execution.limit_offset_bps / 10_000.0
+            if self.cfg.execution.order_type == "limit"
+            else 0.0
+        )
+        self._reject_small_order(
+            symbol, size, price * (1 + offset) if is_buy else price * (1 - offset)
+        )
 
         if self.dry_run:
             self.journal.event(
@@ -721,7 +796,7 @@ class Broker:
                 note="dry_run active: no order was sent",
             )
         else:
-            self._ensure_sdk()
+            # `_ensure_sdk` already ran, above the rounding: it is idempotent.
             try:
                 # Update leverage before sizing the order.
                 self._exchange.update_leverage(leverage, symbol, is_cross=True)
@@ -763,7 +838,7 @@ class Broker:
             # and later "close" exposure it never had.
             state, filled_size, avg_px = self._parse_order_result(result)
             if state == "error":
-                raise ExecutionError(f"order rejected: {avg_px!r}")
+                raise ExecutionError(f"order rejected: {self._order_error(result)}")
 
             if state == "resting":
                 resolved = self._resolve_resting_order(symbol, size)
@@ -847,6 +922,25 @@ class Broker:
     # Fill verification
     # ------------------------------------------------------------------
     @staticmethod
+    def _order_error(result: Any) -> str:
+        """The venue's own words for a refused order.
+
+        `_parse_order_result` collapses the error case to `("error", 0.0, 0.0)`,
+        so the text was dropped on the floor and `open_position` reported
+        `order rejected: 0.0` - naming neither the rule nor the field that
+        violated it. The refusal text is the only part that says what to fix:
+        `Order has invalid size.` and `Order must have minimum value of $10.`
+        call for completely different changes, and the log could not tell them
+        apart.
+        """
+        statuses = (
+            (result or {}).get("response", {}).get("data", {}).get("statuses") or []
+        )
+        if statuses and isinstance(statuses[0], dict) and "error" in statuses[0]:
+            return str(statuses[0]["error"])
+        return repr(result)
+
+    @staticmethod
     def _parse_order_result(result: Any) -> tuple[str, float, float]:
         """Classify an order response as ('filled'|'resting'|'error', size, price).
 
@@ -854,6 +948,8 @@ class Broker:
             {"filled": {"totalSz": "1.0", "avgPx": "100.0", "oid": N}}
             {"resting": {"oid": N}}
             {"error": "..."}
+
+        The error case discards the message here; `_order_error` recovers it.
         """
         statuses = (
             (result or {}).get("response", {}).get("data", {}).get("statuses") or []
@@ -1055,7 +1151,12 @@ class Broker:
             ),
         )
         try:
-            result = self._exchange.market_close(symbol)
+            # `_market_close_confirmed`, because a refused close returns a
+            # status rather than raising, and treating that as a successful
+            # unwind would hand back a *recoverable* error for a position that
+            # is still open and still unprotected - skipping `on_unprotected`,
+            # which exists to demand manual intervention.
+            result = self._market_close_confirmed(symbol)
             self.journal.event(
                 "unwound_unprotected",
                 symbol=symbol,
@@ -1169,6 +1270,46 @@ class Broker:
                 result=result,
             )
 
+    def _market_close_confirmed(self, symbol: str) -> Any:
+        """`market_close`, with an unconfirmed close turned into an exception.
+
+        `Exchange.market_close()` does NOT raise when the venue refuses the
+        order - it returns the same `{"error": ...}` status `order()` does,
+        which `_parse_order_result` already handles on the entry path. Both
+        callers of this treated any returned value as a close, so a refused
+        close was indistinguishable from a filled one:
+
+        - `close_position` journalled `close_placed` and told its caller the
+          position was gone. `bot.close_position` then added a fabricated PnL
+          to the run stats, fed it to `discipline.record_outcome`, and cleared
+          `self.position` - the agent walked away from exposure it still had,
+          with an invented result in its guardrails.
+        - `_unwind_unprotected` journalled `unwound_unprotected` and returned a
+          *recoverable* error, so the agent carried on while the position sat
+          open and unprotected, and `on_unprotected` - the path that demands
+          manual intervention - was never called.
+
+        A market order has no legitimate resting state, so this requires a fill
+        rather than merely the absence of an error. Anything else leaves the
+        position tracked for reconciliation, which is what both callers already
+        do safely with a raise.
+
+        Measured way for it to be refused: the minimum applies to a reduce-only
+        *market* order - a $5.21 partial close of a $10.41 position came back
+        `Order must have minimum value of $10` with the position unchanged -
+        while a reduce-only *trigger* order is exempt. A position whose value
+        falls below $10 therefore cannot be closed this way; the stop resting
+        on the venue, which is exempt, is what closes it.
+        """
+        result = self._exchange.market_close(symbol)
+        state, filled, _ = self._parse_order_result(result)
+        if state != "filled":
+            raise ExecutionError(
+                f"market_close for {symbol} is not confirmed as filled (venue "
+                f"returned {state!r}, filled {filled}): {result}"
+            )
+        return result
+
     def close_position(self, position: Position, price: float, reason: str) -> float:
         """Close a position and return the realised PnL.
 
@@ -1177,6 +1318,11 @@ class Broker:
         does not surface a fill price. In live mode this makes the tracked PnL
         a close approximation, not an exact accounting figure; reconciliation
         against the venue is what eventually settles it.
+
+        Raises rather than returning a PnL when the close is not confirmed as
+        filled. The caller is told the truth about whether the position is
+        gone, and a refused close is precisely the case it must not mistake for
+        one - see `_market_close_confirmed` for what that mistake cost.
         """
         pnl = position.unrealized_pnl(price)
 
@@ -1195,7 +1341,9 @@ class Broker:
         else:
             self._ensure_sdk()
             try:
-                result = self._exchange.market_close(position.symbol)
+                result = self._market_close_confirmed(position.symbol)
+            except ExecutionError:
+                raise
             except Exception as exc:  # noqa: BLE001
                 raise ExecutionError(f"market_close failed for {position.symbol}: {exc}") from exc
             self.journal.event(

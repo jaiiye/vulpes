@@ -73,7 +73,11 @@ class FakeExchange:
 
     def market_close(self, symbol):
         self.close_calls += 1
-        return {"status": "ok"}
+        # The venue answers a market close with an order status like any other
+        # order. `{"status": "ok"}` is a shape it never returns, and it became
+        # load-bearing once `Broker._market_close_confirmed` started reading
+        # this value: a close without a fill is not a close.
+        return filled(0.001, 0.0, oid=99)
 
     def cancel(self, name, oid):
         self.cancels.append((name, oid))
@@ -826,6 +830,407 @@ class TestSdkInitFailureIsRecoverable(ExecutionTestCase):
         )
         with self.assertRaises(ExecutionError):
             broker.live_positions()
+
+
+# ---------------------------------------------------------------------------
+# The venue's minimum order value
+# ---------------------------------------------------------------------------
+
+
+class MinValueFakeExchange(FakeExchange):
+    """A fake that enforces the venue's minimum order value.
+
+    Same reasoning as `PriceRuleFakeExchange`: the rule belongs to the venue,
+    and `FakeExchange` echoes whatever it is handed. This one refuses the way
+    the venue does - as a normal response, not an exception - and only for the
+    orders the venue refuses.
+
+    The exemption is keyed on the order being a *trigger* order, which is what
+    was measured, not on `reduce_only`, which is what it looks like:
+
+        entry             $ 9.54   refused
+        entry             $10.40   accepted
+        reduce-only stop  $ 9.03   accepted   (trigger)
+        reduce-only close $ 5.21   refused    (market)
+    """
+
+    def __init__(self, minimum: float = 10.0, **kw):
+        super().__init__(**kw)
+        self.minimum = minimum
+        self.refused: list[float] = []
+
+    @staticmethod
+    def _is_trigger(order_type) -> bool:
+        return isinstance(order_type, dict) and "trigger" in order_type
+
+    def _refusal(self, value: float):
+        if value >= self.minimum:
+            return None
+        self.refused.append(value)
+        return {
+            "response": {
+                "data": {
+                    "statuses": [
+                        {
+                            "error": f"Order must have minimum value of "
+                            f"${self.minimum:g}. asset=3"
+                        }
+                    ]
+                }
+            }
+        }
+
+    def order(self, symbol, is_buy, size, px, order_type, reduce_only=False):
+        if not self._is_trigger(order_type):
+            refusal = self._refusal(size * px)
+            if refusal is not None:
+                return refusal
+        return super().order(symbol, is_buy, size, px, order_type, reduce_only)
+
+
+class RefusingCloseFakeExchange(FakeExchange):
+    """A fake whose market close is refused, the way the venue refuses one.
+
+    Measured: a $5.21 reduce-only partial close of a $10.41 position came back
+    `Order must have minimum value of $10. asset=3`, and the position was
+    unchanged - a refused close does not partially close.
+    """
+
+    def market_close(self, symbol):
+        self.close_calls += 1
+        return {
+            "response": {
+                "data": {
+                    "statuses": [
+                        {"error": "Order must have minimum value of $10. asset=3"}
+                    ]
+                }
+            }
+        }
+
+
+class UnconfirmableCloseFakeExchange(FakeExchange):
+    """A fake whose close comes back without a fill.
+
+    The venue does not answer this way today. It is here because
+    `_parse_order_result` maps any shape it does not recognise to "resting",
+    and a market order cannot rest - so an unrecognised response means the
+    close is unconfirmed, which must not be reported as done.
+    """
+
+    def market_close(self, symbol):
+        self.close_calls += 1
+        return {"status": "ok"}
+
+
+class ExecutionValueTestCase(ExecutionTestCase):
+    """Shared fixtures for the two classes below."""
+
+    def broker_for(self, exchange, **kw):
+        broker = self.broker(exchange=exchange, **kw)
+        broker._sz_decimals["BTC"] = 5
+        return broker
+
+    @staticmethod
+    def position(size=0.00012, entry=87_000.0):
+        return Position(
+            symbol="BTC",
+            side="long",
+            size=size,
+            entry_price=entry,
+            notional=size * entry,
+            leverage=3,
+            is_dry_run=False,
+        )
+
+    def journal_text(self) -> str:
+        # The journal file is created lazily, so "nothing was written" and "no
+        # file" are the same state.
+        path = Path(self.tmp.name) / "journal.jsonl"
+        return path.read_text() if path.exists() else ""
+
+
+class TestMinimumOrderValue(ExecutionValueTestCase):
+    """The $10 minimum is checked before the order is sent.
+
+    Recorded from a live testnet run as a two-line footnote - "`0.0001 BTC` was
+    refused (`Order must have minimum value of $10`)" - which understated it.
+    For an account whose allocation budget lands below $10 that refusal is what
+    happens on every signal, and nothing in the log says why: the cycle prints
+    `ENTER ...` and then `ORDER FAILED: order rejected: 'Order must have minimum
+    value of $10.'`, which reads like a broken integration rather than a small
+    account.
+    """
+
+    def test_an_entry_below_the_minimum_is_refused_before_it_is_sent(self):
+        """The property is that the venue never sees it. Asserting only
+        `ExecutionError` would also pass with the check removed, because the
+        venue's own refusal raises the same type - so the call count is part of
+        the assertion."""
+        ex = MinValueFakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex)
+
+        with self.assertRaises(ExecutionError) as ctx:
+            broker.open_position("BTC", "long", 0.00011, 87_000.0, 3)
+
+        self.assertEqual(ex.orders, [], "no order should have reached the venue")
+        self.assertIn("minimum order value", str(ctx.exception))
+
+    def test_an_entry_at_or_above_the_minimum_is_sent(self):
+        ex = MinValueFakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex)
+
+        broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        self.assertEqual(len(ex.orders), 1)
+        self.assertEqual(ex.refused, [])
+
+    def test_the_message_states_the_value_and_the_limit(self):
+        broker = self.broker_for(MinValueFakeExchange(order_result=filled(1.0, 1.0)))
+
+        with self.assertRaises(ExecutionError) as ctx:
+            broker._reject_small_order("BTC", 1.0, 9.5)
+
+        message = str(ctx.exception)
+        self.assertIn("$9.50", message)
+        self.assertIn("$10 minimum order value", message)
+
+    def test_the_limit_is_inclusive(self):
+        """The rule reads "minimum value of $10", so exactly $10 is allowed.
+
+        The exact boundary could NOT be measured: the venue's size quantum on
+        BTC is 0.00001 = $0.87 at $87k, wider than the gap between the largest
+        refused case ($9.54) and the smallest accepted one ($10.40). So this
+        follows the venue's own wording rather than a measurement, and is
+        pinned here so the choice is visible rather than implied by a `<`.
+        """
+        broker = self.broker_for(MinValueFakeExchange(order_result=filled(1.0, 1.0)))
+
+        broker._reject_small_order("BTC", 1.0, 10.0)  # exactly at it: allowed
+
+        with self.assertRaises(ExecutionError):
+            broker._reject_small_order("BTC", 1.0, 9.999)  # just under: refused
+
+    def test_the_rounded_size_decides_when_the_two_straddle_the_limit(self):
+        """The venue values the order it receives, not the one requested.
+
+        `0.0001142` requests $10.01 of value, but with `szDecimals = 6` the
+        venue can only receive `0.000114`, which is $9.99 - so this must be
+        refused. A check on the requested size would send it and be refused
+        anyway, which is the outcome the check exists to avoid.
+        """
+        ex = MinValueFakeExchange(order_result=filled(0.0001, 87_650.0))
+        broker = self.broker(exchange=ex)
+        broker._sz_decimals["BTC"] = 6
+
+        with self.assertRaises(ExecutionError):
+            broker.open_position("BTC", "long", 0.0001142, 87_650.0, 3)
+
+        self.assertEqual(ex.orders, [])
+
+    def test_a_dry_run_refuses_it_too(self):
+        """A dry run that reported an entry the live path refuses would be
+        wrong about the one thing it exists to rehearse."""
+        broker = Broker(self.cfg, None, self.journal)
+        self.assertTrue(broker.dry_run)
+
+        with self.assertRaises(ExecutionError):
+            broker.open_position("BTC", "long", 0.0001, 87_000.0, 3)
+
+        self.assertNotIn("order_simulated", self.journal_text())
+
+    def test_a_trigger_order_below_the_minimum_is_still_accepted(self):
+        """$9.03 of stop on a $10.41 position is the live case that was
+        accepted while a same-sized market close was refused. Requiring the
+        protective orders to clear the minimum would refuse entries that work,
+        so this pins the exemption."""
+        ex = MinValueFakeExchange(order_result=resting(1))
+        broker = self.broker_for(ex)
+
+        broker._attach_protection("BTC", "long", 0.00012, 70_000.0, None)
+
+        self.assertEqual(len(ex.orders), 1)
+        self.assertEqual(ex.refused, [])
+
+
+class TestCloseConfirmation(ExecutionValueTestCase):
+    """A refused close must not be reported as a close.
+
+    `Exchange.market_close()` returns a status instead of raising when the
+    venue refuses, exactly as `order()` does. `_attach_protection` already
+    documented and handled that rule; both close paths did not.
+    """
+
+    def test_a_confirmed_close_returns_the_pnl(self):
+        ex = FakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex)
+
+        pnl = broker.close_position(self.position(), 88_000.0, "test")
+
+        self.assertAlmostEqual(pnl, (88_000.0 - 87_000.0) * 0.00012, places=6)
+        self.assertIn("close_placed", self.journal_text())
+
+    def test_a_refused_close_raises_instead_of_returning_a_pnl(self):
+        """It used to return a PnL, so `bot.close_position` cleared
+        `self.position`, added the invented PnL to the run stats and fed it to
+        `discipline.record_outcome` - the agent walked away from exposure it
+        still had, with a made-up result in its guardrails."""
+        ex = RefusingCloseFakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex)
+
+        with self.assertRaises(ExecutionError) as ctx:
+            broker.close_position(self.position(), 86_000.0, "test")
+
+        self.assertIn("not confirmed as filled", str(ctx.exception))
+        self.assertNotIn("close_placed", self.journal_text())
+
+    def test_a_close_without_a_fill_is_not_treated_as_one(self):
+        ex = UnconfirmableCloseFakeExchange(order_result=filled(1.0, 1.0))
+        broker = self.broker_for(ex)
+
+        with self.assertRaises(ExecutionError):
+            broker.close_position(self.position(), 86_000.0, "test")
+
+        self.assertNotIn("close_placed", self.journal_text())
+
+    def test_a_refused_unwind_stops_the_agent_and_reports_the_exposure(self):
+        """`_unwind_unprotected` used to turn a refused close into a
+        *recoverable* error: the agent kept running with a position open and
+        unprotected, and `on_unprotected` - the channel that demands manual
+        intervention - was never called."""
+        reported = []
+        ex = RefusingCloseFakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex, on_unprotected=reported.append)
+
+        raised = broker._unwind_unprotected(
+            "BTC", "long", 0.00012, 87_000.0, ExecutionError("protection failed")
+        )
+
+        self.assertIsInstance(raised, CriticalExecutionError)
+        self.assertEqual(len(reported), 1)
+        self.assertEqual(reported[0].symbol, "BTC")
+
+    def test_a_successful_unwind_stays_recoverable(self):
+        """Stopping everything is for an unconfirmed close, not for every
+        unwind - otherwise an ordinary protection failure would halt the run."""
+        ex = FakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker_for(ex)
+
+        raised = broker._unwind_unprotected(
+            "BTC", "long", 0.00012, 87_000.0, ExecutionError("protection failed")
+        )
+
+        self.assertNotIsInstance(raised, CriticalExecutionError)
+        self.assertIsInstance(raised, ExecutionError)
+        self.assertIn("unwound_unprotected", self.journal_text())
+
+
+class RefusingOrderFakeExchange(FakeExchange):
+    """A fake whose entry is refused with whatever wording it is given."""
+
+    def __init__(self, error: str, **kw):
+        super().__init__(**kw)
+        self.error = error
+
+    def order(self, symbol, is_buy, size, px, order_type, reduce_only=False):
+        self.orders.append((symbol, is_buy, size, px, order_type, reduce_only))
+        return {"response": {"data": {"statuses": [{"error": self.error}]}}}
+
+
+class TestRejectionIsDiagnosable(ExecutionValueTestCase):
+    """A refused order must report the venue's own words.
+
+    `_parse_order_result` returns `("error", 0.0, 0.0)` and the caller printed
+    the *price* from that tuple, so every refusal surfaced as
+    `order rejected: 0.0`. Found by trying to diagnose one: the live message
+    named neither the rule nor the field, and the two rules it could have been
+    call for different fixes.
+    """
+
+    def test_a_refused_entry_reports_the_venue_s_text(self):
+        ex = RefusingOrderFakeExchange(
+            "Order has invalid size.", order_result=filled(1.0, 1.0)
+        )
+        broker = self.broker_for(ex)
+
+        with self.assertRaises(ExecutionError) as ctx:
+            broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        message = str(ctx.exception)
+        self.assertIn("Order has invalid size.", message)
+        self.assertNotIn("rejected: 0.0", message)
+
+    def test_the_other_rule_is_still_distinguishable(self):
+        """The two refusals must not collapse to the same log line."""
+        ex = RefusingOrderFakeExchange(
+            "Order must have minimum value of $10. asset=3",
+            order_result=filled(1.0, 1.0),
+        )
+        broker = self.broker_for(ex)
+
+        with self.assertRaises(ExecutionError) as ctx:
+            broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        self.assertIn("minimum value of $10", str(ctx.exception))
+
+    def test_a_missing_error_text_falls_back_to_the_raw_response(self):
+        """Never silently blank: if the shape is unexpected, show what came."""
+        broker = self.broker_for(FakeExchange(order_result=filled(1.0, 1.0)))
+
+        self.assertEqual(broker._order_error({"unexpected": "shape"}), "{'unexpected': 'shape'}")
+
+
+class TestSizeIsRoundedWithTheVenueDecimals(ExecutionValueTestCase):
+    """`szDecimals` must be known before the entry is rounded.
+
+    `_round_size` rounds to `self._sz_decimals`, which `_ensure_sdk` fills from
+    the venue's metadata - but the rounding ran first, so the *first* live order
+    after startup used the fallback of 6 decimals. Measured on testnet:
+    `0.000121` BTC against `szDecimals = 5` came back
+    `Order has invalid size.`, and the agent logged `order rejected: 0.0`.
+
+    The SDK is not installed in the offline test environment, so `_ensure_sdk`
+    is stubbed - the same constraint the `_ensure_sdk` failure tests work under.
+    What is pinned is the *order* of the two calls, which is the whole fix.
+    """
+
+    def test_the_sdk_is_initialised_before_the_size_is_rounded(self):
+        ex = MinValueFakeExchange(order_result=filled(0.00012, 87_000.0))
+        broker = self.broker(exchange=None)
+        calls = []
+
+        def fake_ensure_sdk():
+            # Exactly what the real one does that matters here: cache
+            # `szDecimals` from the venue's metadata.
+            calls.append(1)
+            broker._exchange = ex
+            broker._sz_decimals["BTC"] = 5
+
+        broker._ensure_sdk = fake_ensure_sdk
+        self.assertEqual(broker._sz_decimals, {}, "must start uncached")
+
+        broker.open_position("BTC", "long", 0.000121, 87_000.0, 3)
+
+        self.assertEqual(calls, [1], "the SDK must be initialised")
+        self.assertEqual(len(ex.orders), 1)
+        self.assertEqual(
+            ex.orders[0][2],
+            0.00012,
+            "6 decimals is what the venue refuses (Order has invalid size.); "
+            "5 is what it takes",
+        )
+
+    def test_a_dry_run_never_initialises_the_sdk(self):
+        """A dry run has no credentials, and this call moved in front of the
+        branch that used to hold it - so it must not become unconditional."""
+        broker = Broker(self.cfg, None, self.journal)
+        broker._ensure_sdk = lambda: (_ for _ in ()).throw(
+            AssertionError("a dry run must not build an exchange client")
+        )
+
+        broker.open_position("BTC", "long", 0.00012, 87_000.0, 3)
+
+        self.assertIn("order_simulated", self.journal_text())
 
 
 if __name__ == "__main__":
