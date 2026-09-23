@@ -21,10 +21,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from agent.config import ConfigError, load_config  # noqa: E402
 from agent.snapshots import (  # noqa: E402
+    DEFAULT_MARKET_SNAPSHOT_PATH,
     DEFAULT_SNAPSHOT_PATH,
+    MARKET_SNAPSHOT_INTERVAL_SECONDS,
+    MarketSnapshotRecorder,
     SnapshotRecorder,
     coverage_summary,
+    load_market_records,
     load_records,
+    market_coverage_summary,
 )
 from run_bot import DEFAULT_CONFIG, load_dotenv  # noqa: E402
 
@@ -52,6 +57,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="force the curated Hyperfeed (the config's use_hyperfeed also enables it)",
     )
+    p.add_argument(
+        "--market-path",
+        default=DEFAULT_MARKET_SNAPSHOT_PATH,
+        help="JSONL output path for aggregate positioning",
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "record a market snapshot even when the newest is younger than an "
+            f"hour - {MARKET_SNAPSHOT_INTERVAL_SECONDS / 3600:.0f}h is the native "
+            "cadence of funding and of Binance's long-short series"
+        ),
+    )
     return p
 
 
@@ -60,9 +79,11 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(Path(".env"))
 
     if args.summary:
-        records = load_records(args.path)
-        print(f"snapshot file: {args.path}")
-        print(coverage_summary(records))
+        print(f"whale snapshots: {args.path}")
+        print(coverage_summary(load_records(args.path)))
+        print()
+        print(f"market snapshots: {args.market_path}")
+        print(market_coverage_summary(load_market_records(args.market_path)))
         return 0
 
     symbols = tuple(s.strip().upper() for s in args.symbols.split(",") if s.strip())
@@ -84,14 +105,26 @@ def main(argv: list[str] | None = None) -> int:
     )
     written = recorder.record(symbols)
 
+    # The market side skips itself whenever the newest record is under an hour
+    # old, so running this every 15 minutes wastes three calls in four and
+    # nothing else.
+    market = MarketSnapshotRecorder(path=args.market_path)
+    market_written = market.record(symbols, force=args.force)
+
     print(
-        f"recorded {written}/{len(symbols)} snapshots for "
-        f"{', '.join(symbols)} in {time.time() - started:.1f}s -> {args.path}"
+        f"recorded {written}/{len(symbols)} whale snapshots and "
+        f"{1 if market_written else 0} market snapshot in "
+        f"{time.time() - started:.1f}s"
     )
     for error in recorder.errors:
-        print(f"  error: {error}", file=sys.stderr)
+        print(f"  whale error: {error}", file=sys.stderr)
+    for error in market.errors:
+        print(f"  market error: {error}", file=sys.stderr)
 
-    return 0 if written else 1
+    # Either one landing means this pass did something. The exit code becomes
+    # the cron's failure count, and a pass that recorded the market while the
+    # whale source failed is not a pass that failed.
+    return 0 if (written or market_written) else 1
 
 
 if __name__ == "__main__":

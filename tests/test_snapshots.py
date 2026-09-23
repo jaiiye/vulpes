@@ -18,16 +18,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import agent.snapshots as snapshots_module  # noqa: E402
 from agent.config import load_config  # noqa: E402
 from agent.factors.smart_money import (  # noqa: E402
     SmartMoneySnapshot,
     WalletPosition,
 )
+from agent.http_util import HttpError  # noqa: E402
+from agent.market_data import AssetContext  # noqa: E402
 from agent.snapshots import (  # noqa: E402
+    MarketSnapshotRecorder,
     SnapshotRecord,
     SnapshotRecorder,
     coverage_summary,
+    load_market_records,
     load_records,
+    market_coverage_summary,
 )
 
 WHALE = "0x" + "a" * 40
@@ -245,6 +251,219 @@ class TestCoverageSummary(unittest.TestCase):
         text = coverage_summary([a, b])
         self.assertIn("BTC", text)
         self.assertIn("ETH", text)
+
+
+class FakeMarket:
+    """Just enough market to answer `asset_contexts`."""
+
+    def __init__(self, contexts):
+        self._contexts = contexts
+
+    def asset_contexts(self):
+        return self._contexts
+
+
+def context(name, **over) -> AssetContext:
+    fields = dict(
+        index=0,
+        name=name,
+        mark_price=100.0,
+        oracle_price=100.0,
+        funding=1e-5,
+        open_interest=50.0,
+        day_volume=1_000_000.0,
+    )
+    fields.update(over)
+    return AssetContext(**fields)
+
+
+class TestMarketRecorder(unittest.TestCase):
+    """The aggregate-positioning recorder.
+
+    Its whole reason for existing is that these series have no usable history -
+    Binance caps its own at ~20 days and Hyperliquid publishes none at all - so
+    what is worth pinning is what lands in a record, and what happens when half a
+    collection fails.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "market.jsonl"
+
+    def stub_binance(self, responses: dict) -> None:
+        """Answer by URL fragment. A fragment missing from `responses` raises,
+        which is how a per-series failure gets exercised."""
+        original = snapshots_module.request_json
+
+        def fake(url, **kwargs):
+            for fragment, value in responses.items():
+                if fragment in url:
+                    return value
+            raise HttpError(f"no stub for {url}")
+
+        snapshots_module.request_json = fake
+        self.addCleanup(lambda: setattr(snapshots_module, "request_json", original))
+
+    def recorder(self, contexts, responses=None) -> MarketSnapshotRecorder:
+        self.stub_binance(
+            responses
+            if responses is not None
+            else {
+                "takerlongshortRatio": [
+                    {"buyVol": "60", "sellVol": "40", "buySellRatio": "1.5"}
+                ],
+                "globalLongShortAccountRatio": [
+                    {
+                        "longAccount": "0.7",
+                        "shortAccount": "0.3",
+                        "longShortRatio": "2.33",
+                    }
+                ],
+                "premiumIndex": {
+                    "markPrice": "101",
+                    "indexPrice": "100",
+                    "lastFundingRate": "0.0001",
+                },
+            }
+        )
+        return MarketSnapshotRecorder(path=self.path, market=FakeMarket(contexts))
+
+    def last_record(self):
+        return load_market_records(self.path)[-1]
+
+    def test_every_perp_is_captured_from_one_call(self):
+        recorder = self.recorder([context("BTC"), context("ETH")])
+
+        self.assertTrue(recorder.record(("BTC",), force=True))
+
+        self.assertEqual(sorted(self.last_record().hyperliquid), ["BTC", "ETH"])
+
+    def test_perps_with_no_open_interest_are_left_out(self):
+        """Delisted names come back with every field at zero - measured, 56 of
+        234 on mainnet - and a market that does not exist has no positioning.
+
+        The first version of this test asserted a leading-"@" filter, which was
+        simply wrong about the venue: this endpoint is perps only. It passed, and
+        the code excluded nothing, which is how the mistake survived a green
+        suite until a real collection was counted.
+        """
+        recorder = self.recorder([context("BTC"), context("MATIC", open_interest=0.0)])
+
+        recorder.record(("BTC",), force=True)
+
+        self.assertEqual(list(self.last_record().hyperliquid), ["BTC"])
+
+    def test_the_premium_is_the_mark_against_the_oracle(self):
+        """The one field here the candle archive cannot reconstruct: it is the
+        perp's own mark against its oracle, not a traded price."""
+        recorder = self.recorder([context("BTC", mark_price=101.0, oracle_price=100.0)])
+
+        recorder.record(("BTC",), force=True)
+
+        self.assertAlmostEqual(
+            self.last_record().hyperliquid["BTC"]["premium"], 0.01, places=8
+        )
+
+    def test_the_two_series_hyperliquid_does_not_publish_are_stored(self):
+        recorder = self.recorder([context("BTC")])
+
+        recorder.record(("BTC",), force=True)
+
+        binance = self.last_record().binance["BTC"]
+        self.assertEqual(binance["taker"]["buy_vol"], 60.0)
+        self.assertEqual(binance["taker"]["ratio"], 1.5)
+        self.assertEqual(binance["accounts"]["long_share"], 0.7)
+        self.assertEqual(binance["funding"]["funding_rate"], 0.0001)
+
+    def test_a_failed_series_is_recorded_rather_than_swallowed(self):
+        """A symbol silently missing one of three series is a hole nothing
+        downstream can see."""
+        recorder = self.recorder([context("BTC")], responses={})
+
+        recorder.record(("BTC",), force=True)
+
+        record = self.last_record()
+        self.assertEqual(record.binance["BTC"], {})
+        joined = " ".join(record.errors)
+        self.assertIn("taker", joined)
+        self.assertIn("accounts", joined)
+        self.assertIn("funding", joined)
+
+    def test_a_failed_market_call_still_records_the_other_half(self):
+        """Partial is worth more than nothing, provided it says so."""
+
+        class Broken(FakeMarket):
+            def asset_contexts(self):
+                raise HttpError("venue unreachable")
+
+        self.stub_binance(
+            {
+                "premiumIndex": {
+                    "markPrice": "101",
+                    "indexPrice": "100",
+                    "lastFundingRate": "0.0001",
+                }
+            }
+        )
+        recorder = MarketSnapshotRecorder(
+            path=self.path, market=Broken([context("BTC")])
+        )
+
+        self.assertTrue(recorder.record(("BTC",), force=True))
+
+        record = self.last_record()
+        self.assertEqual(record.hyperliquid, {})
+        self.assertIn("hyperliquid", " ".join(record.errors))
+        self.assertIn("BTC", record.binance)
+
+    def test_a_second_call_within_the_hour_writes_nothing(self):
+        """The series update hourly, so three passes in four have nothing new to
+        add - and this file grows forever."""
+        recorder = self.recorder([context("BTC")])
+        recorder.record(("BTC",), force=True)
+
+        self.assertFalse(recorder.record(("BTC",)))
+
+    def test_force_records_anyway(self):
+        recorder = self.recorder([context("BTC")])
+
+        recorder.record(("BTC",), force=True)
+        self.assertTrue(recorder.record(("BTC",), force=True))
+
+        self.assertEqual(len(load_market_records(self.path)), 2)
+
+    def test_the_interval_is_measured_against_the_file(self):
+        """Read from the newest line, not from process state: there is no second
+        copy of the clock to lose across a restart."""
+        recorder = self.recorder([context("BTC")])
+        recorder.record(("BTC",), force=True)
+        payload = json.loads(self.path.read_text().splitlines()[-1])
+        payload["timestamp"] -= 7200
+        self.path.write_text(json.dumps(payload) + "\n")
+
+        self.assertTrue(recorder.record(("BTC",)))
+
+    def test_load_skips_malformed_lines(self):
+        self.path.write_text(
+            '{"timestamp": 1.0, "hyperliquid": {"BTC": {}}}\nnot json\n'
+        )
+
+        self.assertEqual(len(load_market_records(self.path)), 1)
+
+    def test_a_missing_file_reads_as_empty(self):
+        self.assertEqual(load_market_records(self.path), [])
+        self.assertIn("no market snapshots", market_coverage_summary([]))
+
+    def test_coverage_flags_a_short_history_and_partial_rows(self):
+        recorder = self.recorder([context("BTC")], responses={})
+        recorder.record(("BTC",), force=True)
+
+        summary = market_coverage_summary(load_market_records(self.path))
+
+        self.assertIn("NOT YET USABLE", summary)
+        self.assertIn("recorded with an error", summary)
+        self.assertIn("1 Hyperliquid perps", summary)
 
 
 if __name__ == "__main__":
