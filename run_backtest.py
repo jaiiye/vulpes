@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import datetime as dt
+import json
 import math
 import sys
 import time
@@ -184,6 +185,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="pin the window to end at the close of this UTC day. Without it "
         "the window ends at the current time, so two runs on different days "
         "describe different periods and their numbers are not comparable.",
+    )
+    p.add_argument(
+        "--dump-trades",
+        default=None,
+        metavar="PATH",
+        help="write the per-trade results to this JSON file. The summary PF is a "
+        "point estimate, and on ~80 trades two of them can sit in the same "
+        "noise band - measured before, when PF 1.52 and PF 1.03 turned out to "
+        "be indistinguishable under bootstrap resampling. Resampling needs the "
+        "trades themselves, which the console output does not carry.",
     )
     p.add_argument("--quiet", action="store_true", help="suppress progress output")
     return p
@@ -423,7 +434,60 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _report_pooled(runs, datasets, config, dataset_warnings, runtime)
 
+    if args.dump_trades:
+        _dump_trades(Path(args.dump_trades), runs, args, config)
+
     return 0
+
+
+def _dump_trades(
+    path: Path,
+    runs: list[tuple[str, Any, Metrics, Any]],
+    args: argparse.Namespace,
+    config: Any,
+) -> None:
+    """Write the per-trade results, plus what produced them.
+
+    The metadata is not decoration: two arms of one comparison are only
+    comparable if they were run over the same window with the same fee, and a
+    dump without it cannot be checked for that later.
+    """
+    if not args.whale_snapshots:
+        arm = "no_whales"
+    elif args.whale_leaderboard:
+        arm = "leaderboard"
+    else:
+        arm = "size_selected_whales"
+    payload = {
+        "arm": arm,
+        "max_fills_per_day": args.whale_max_fills_per_day,
+        "symbols": [sym for sym, _, _, _ in runs],
+        "days": args.days,
+        "as_of": args.as_of,
+        "fee_bps": args.fee_bps,
+        "equity": args.equity,
+        "smart_money_weight": (
+            0.0 if not args.whale_snapshots else config.weights.smart_money
+        ),
+        "trades": [
+            {
+                "symbol": t.symbol,
+                "side": t.side,
+                "entry_time": t.entry_time,
+                "exit_time": t.exit_time,
+                "notional": t.notional,
+                "gross_pnl": t.gross_pnl,
+                "fees": t.fees,
+                "net_pnl": t.net_pnl,
+                "exit_reason": t.exit_reason,
+                "entry_score": t.entry_score,
+            }
+            for _, result, _, _ in runs
+            for t in result.trades
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    print(f"\n  trades written to {path}  ({len(payload['trades'])} round trips)")
 
 
 def _whale_coverage_days(history: dict, start_ms: int, end_ms: int) -> float:

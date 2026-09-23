@@ -1551,6 +1551,78 @@ class TestWhaleCoverageWarning(unittest.TestCase):
         self.assertEqual(covered, 6.0)
 
 
+class TestTradeDump(unittest.TestCase):
+    """`--dump-trades` exists because a PF comparison without error bars is not
+    a measurement - PF 1.52 and PF 1.03 were once shown to be indistinguishable
+    here, on samples of this size.
+
+    What is pinned is the metadata, because that is what makes two dumps
+    comparable: the arms of one comparison differ in the smart money weight and
+    nothing else, and a dump that mislabels the arm is worse than no dump.
+    """
+
+    def _dump(self, **overrides):
+        import json
+        import tempfile
+        from argparse import Namespace
+        from types import SimpleNamespace
+
+        from run_backtest import _dump_trades
+
+        args = Namespace(
+            whale_snapshots=None,
+            whale_leaderboard=False,
+            whale_max_fills_per_day=None,
+            days=79,
+            as_of="2026-06-15",
+            fee_bps=3.5,
+            equity=1000.0,
+        )
+        for key, value in overrides.items():
+            setattr(args, key, value)
+
+        trade = SimpleNamespace(
+            symbol="BTC", side="long", entry_time=1, exit_time=2, notional=100.0,
+            gross_pnl=1.0, fees=0.1, net_pnl=0.9, exit_reason="take_profit",
+            entry_score=70.0,
+        )
+        runs = [("BTC", SimpleNamespace(trades=[trade]), None, None)]
+        config = SimpleNamespace(weights=SimpleNamespace(smart_money=0.40))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trades.json"
+            _dump_trades(path, runs, args, config)
+            return json.loads(path.read_text())
+
+    def test_a_weight_zeroed_run_says_so(self):
+        payload = self._dump()
+        self.assertEqual(payload["arm"], "no_whales")
+        self.assertEqual(payload["smart_money_weight"], 0.0)
+
+    def test_a_leaderboard_run_records_the_weight_and_the_ceiling(self):
+        payload = self._dump(
+            whale_snapshots="data/canonical/positions",
+            whale_leaderboard=True,
+            whale_max_fills_per_day=50,
+        )
+        self.assertEqual(payload["arm"], "leaderboard")
+        self.assertEqual(payload["smart_money_weight"], 0.40)
+        self.assertEqual(payload["max_fills_per_day"], 50)
+
+    def test_the_window_is_recorded_so_two_dumps_can_be_checked_for_it(self):
+        """Two arms are only comparable if they ran the same window; without
+        this the check is not possible after the fact."""
+        payload = self._dump()
+        self.assertEqual(payload["days"], 79)
+        self.assertEqual(payload["as_of"], "2026-06-15")
+        self.assertEqual(payload["fee_bps"], 3.5)
+
+    def test_trades_carry_the_net_pnl_that_resampling_needs(self):
+        payload = self._dump()
+        self.assertEqual(len(payload["trades"]), 1)
+        self.assertAlmostEqual(payload["trades"][0]["net_pnl"], 0.9)
+
+
 class TestSqlTransport(unittest.TestCase):
     """Statements are piped in, because a single argument cannot exceed 128 KB.
 
