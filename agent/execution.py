@@ -26,7 +26,13 @@ from typing import Any
 from .config import BotConfig
 from .http_util import HttpError, request_json
 from .indicators import IndicatorError
-from .market_data import HyperliquidMarket, MarketDataError, safe_candles
+from .market_data import (
+    MAINNET_URL,
+    TESTNET_URL,
+    HyperliquidMarket,
+    MarketDataError,
+    safe_candles,
+)
 from .synthesizer import LONG, SHORT, Journal, Signal
 
 # Last-resort stop distance when ATR cannot be computed, as a fraction of price.
@@ -623,7 +629,6 @@ class Broker:
             import eth_account  # noqa: F401
             from hyperliquid.exchange import Exchange
             from hyperliquid.info import Info
-            from hyperliquid.utils import constants
         except ImportError as exc:
             raise ExecutionError(
                 "live trading requires the official SDK. Install with:\n"
@@ -635,7 +640,7 @@ class Broker:
         if not key:
             raise ExecutionError("HYPERLIQUID_PRIVATE_KEY is not set")
 
-        base_url = constants.TESTNET_API_URL if self.cfg.execution.testnet else constants.MAINNET_API_URL
+        base_url = self.routing_base_url
         wallet = eth_account.Account.from_key(key)
         account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS") or wallet.address
 
@@ -650,13 +655,70 @@ class Broker:
 
         # Cache per-symbol size decimals so orders are not rejected.
         try:
-            meta = self._info.meta()
-            for idx, asset in enumerate(meta.get("universe", [])):
-                self._sz_decimals[str(asset.get("name", "")).upper()] = int(
-                    asset.get("szDecimals", 6)
-                )
+            self._cache_sz_decimals(self._info.meta())
         except Exception as exc:  # noqa: BLE001
             self.journal.event("warn", message=f"could not cache szDecimals: {exc}")
+
+    @property
+    def routing_base_url(self) -> str:
+        """Where orders go, derived in one place.
+
+        The SDK build and the metadata read both need it, and two derivations
+        that disagreed would send orders to one venue while reading another's
+        instrument list - which is the shape of the mistake that put a
+        6-decimal size on a 5-decimal venue.
+        """
+        override = self.cfg.execution.base_url
+        if override:
+            return override.rstrip("/")
+        return TESTNET_URL if self.cfg.execution.testnet else MAINNET_URL
+
+    def _cache_sz_decimals(self, meta: dict[str, Any]) -> None:
+        """Record each asset's `szDecimals` from a `meta` payload."""
+        for asset in meta.get("universe", []):
+            self._sz_decimals[str(asset.get("name", "")).upper()] = int(
+                asset.get("szDecimals", self.SIZE_DECIMALS)
+            )
+
+    def cache_venue_metadata(self) -> None:
+        """Populate the size-decimal cache from the venue's public endpoint.
+
+        Deliberately not through the SDK. `_ensure_sdk` cannot run in a dry run
+        - there are no credentials, and none are needed to read an instrument
+        list - yet `_round_size` falls back to `SIZE_DECIMALS` whenever this
+        cache is empty, and that fallback is what sent `0.000121` BTC, six
+        decimals, to a venue that accepts five. A check whose entire purpose is
+        keeping that off the wire has to be able to establish the fact in the
+        mode people actually run.
+
+        Raises `ExecutionError` when the venue cannot be read at all, which is
+        deliberate: a process that cannot read the instrument list does not
+        know what size to send, and the alternative is learning it from a
+        rejected order later. Transient failures are the retry budget's job,
+        not something to paper over by guessing.
+        """
+        try:
+            meta = request_json(
+                f"{self.routing_base_url}/info",
+                payload={"type": "meta"},
+                timeout=15,
+                retries=3,
+            )
+        except HttpError as exc:
+            raise ExecutionError(
+                f"could not read the venue's instrument list from "
+                f"{self.routing_base_url}: {exc}"
+            ) from exc
+        self._cache_sz_decimals(meta)
+
+    def size_decimals(self, symbol: str) -> int | None:
+        """`szDecimals` for `symbol`, or None when the cache does not have it.
+
+        None rather than `SIZE_DECIMALS`: "this venue's granularity is unknown"
+        and "it is six" are different facts, and only the first should stop a
+        start-up.
+        """
+        return self._sz_decimals.get(symbol.upper())
 
     def _round_size(self, symbol: str, size: float) -> float:
         decimals = self._sz_decimals.get(symbol.upper(), self.SIZE_DECIMALS)

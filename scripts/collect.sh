@@ -155,7 +155,16 @@ if (( rc == 0 )); then
     # combined pattern recorded both, so every pass read as duplicated.
     factors=$(printf '%s' "$out" | grep -E 'factors:' | tail -1)
     cycles=$(printf '%s' "$out" | grep -E 'cycles \|' | tail -1)
+    # The start-up check and anything it complained about. Without this the
+    # filters above drop it, and it is the one line that says whether this
+    # account can place a trade at all - a run that cannot trade looks exactly
+    # like a run that found no signal.
+    flight=$(printf '%s' "$out" | grep -iE 'preflight' | head -1 | sed 's/^.*\] *//')
+    trouble=$(printf '%s' "$out" | grep -iE 'PREFLIGHT FAILED|preflight warning' | tail -1 | sed 's/^.*\] *//')
     log "cycle OK: ${factors:-no factor line} | ${cycles:-no summary}"
+    if [[ -n "$flight" || -n "$trouble" ]]; then
+        log "preflight: ${flight:-not reported}${trouble:+ | $trouble}"
+    fi
 else
     failures=$((failures + 1))
     log "cycle FAILED (rc=$rc): $(printf '%s' "$out" | tail -5 | tr '\n' '|')"

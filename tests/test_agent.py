@@ -21,7 +21,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent.bot import FoxAgent, entry_line  # noqa: E402
+from agent.bot import (  # noqa: E402
+    FoxAgent,
+    Preflight,
+    entry_line,
+    preflight_check,
+)
 from agent.config import ConfigError, load_config  # noqa: E402
 from agent.discipline import (  # noqa: E402
     Discipline,
@@ -3331,6 +3336,203 @@ class TestConfigSafetyRails(unittest.TestCase):
         with self.assertRaises(ConfigError) as ctx:
             load_config(write_config(BASE_CONFIG + "\nrisk:\n  reduce_only_on_exit: true\n"))
         self.assertIn("reduce_only_on_exit", str(ctx.exception))
+
+
+class TestPreflightCheck(unittest.TestCase):
+    """The start-up check, as a pure function.
+
+    Pure on purpose: both failures it exists to catch are facts about a config
+    and an account, so a check that needed a live venue to be testable would
+    have been one that shipped untested.
+    """
+
+    def config(self, **risk_overrides):
+        path = write_config(BASE_CONFIG)
+        self.addCleanup(os.unlink, path)
+        cfg = load_config(path)
+        return replace(cfg, risk=replace(cfg.risk, **risk_overrides))
+
+    def test_a_cached_granularity_and_a_funded_account_pass(self):
+        result = preflight_check(self.config(), equity=1_000.0, sz_decimals=5)
+
+        self.assertIsInstance(result, Preflight)
+        self.assertTrue(result.ok, result.fatal)
+        # No price, so the coarse-step warning has nothing to measure against
+        # and must not fire on a guess.
+        self.assertEqual(result.warnings, [])
+
+    def test_an_uncached_granularity_is_fatal(self):
+        """The `Order has invalid size.` incident: the fallback of six decimals
+        went out against a venue that accepts five."""
+        result = preflight_check(self.config(), equity=1_000.0, sz_decimals=None)
+
+        self.assertFalse(result.ok)
+        self.assertIn("invalid size", " ".join(result.fatal))
+
+    def test_zero_equity_is_fatal(self):
+        result = preflight_check(self.config(), equity=0.0, sz_decimals=5)
+
+        self.assertFalse(result.ok)
+        self.assertIn("nothing to size", " ".join(result.fatal))
+
+    def test_an_allocation_cap_under_the_venue_minimum_is_fatal(self):
+        """The `Order must have minimum value of $10.` incident: an account
+        whose allocation budget sat under the floor, refused on every signal
+        with a message that never said why."""
+        result = preflight_check(
+            self.config(account_allocation_pct=10.0), equity=50.0, sz_decimals=5
+        )
+
+        self.assertFalse(result.ok)
+        self.assertAlmostEqual(result.cap_notional_usd, 5.0, places=6)
+        self.assertIn("account_allocation_pct", " ".join(result.fatal))
+
+    def test_the_fatal_bound_needs_no_price_so_a_blip_cannot_flip_it(self):
+        """It rests on an upper bound and nothing else, which is what makes it
+        safe to stop a run over."""
+        result = preflight_check(self.config(), equity=1_000.0, sz_decimals=5)
+
+        self.assertFalse(result.sized)
+        self.assertAlmostEqual(result.expected_notional_usd, 100.0, places=6)
+
+    def test_a_sized_position_under_the_minimum_warns_rather_than_stops(self):
+        """It rests on a price and an ATR read taken at that moment, so it is
+        not grounds for a refusal."""
+        sizing = SizingResult(
+            size=0.0001,
+            notional=8.5,
+            stop_price=None,
+            take_profit_price=None,
+            atr=900.0,
+            risk_usd=20.0,
+        )
+        result = preflight_check(
+            self.config(), equity=1_000.0, sz_decimals=5, sizing=sizing
+        )
+
+        self.assertTrue(result.ok, result.fatal)
+        self.assertAlmostEqual(result.expected_notional_usd, 8.5, places=6)
+        self.assertIn("under the venue's $10 minimum", " ".join(result.warnings))
+
+    def test_the_sized_warning_stays_quiet_when_the_cap_is_also_too_small(self):
+        """Its claim is "the cap is fine but the size that comes out is not".
+        Making it about a cap that is also under the floor would state something
+        false, and the fatal check already covers that case - the first live run
+        of this printed exactly that contradiction."""
+        sizing = SizingResult(
+            size=0.0001,
+            notional=5.0,
+            stop_price=None,
+            take_profit_price=None,
+            atr=900.0,
+            risk_usd=20.0,
+        )
+        result = preflight_check(
+            self.config(), equity=50.0, sz_decimals=5, sizing=sizing
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.warnings, [])
+
+    def test_a_size_that_is_only_a_few_venue_steps_warns(self):
+        """$10 on a $5 coin with `szDecimals = 0` is two steps, so rounding can
+        move the position by 25%."""
+        result = preflight_check(self.config(), equity=100.0, sz_decimals=0, price=5.0)
+
+        self.assertIn("size step", " ".join(result.warnings))
+
+    def test_a_size_with_plenty_of_steps_does_not_warn(self):
+        result = preflight_check(
+            self.config(), equity=1_000.0, sz_decimals=5, price=87_000.0
+        )
+
+        self.assertEqual(result.warnings, [])
+
+
+class TestPreflightAtStartup(unittest.TestCase):
+    """Where the check hooks into `run`, including the one exception.
+
+    The metadata read is stubbed in every test here - it is the only part that
+    touches the network, and the point is the decision, not the transport.
+    """
+
+    def make_agent(self):
+        cfg_path = write_config(BASE_CONFIG)
+        self.addCleanup(os.unlink, cfg_path)
+        cfg = load_config(cfg_path)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cfg.execution.dry_run = True
+        self.journal_path = Path(self.tmp.name) / "journal.jsonl"
+        return FoxAgent(
+            cfg,
+            journal_path=str(self.journal_path),
+            state_path=str(Path(self.tmp.name) / "state.json"),
+        )
+
+    @staticmethod
+    def unreachable():
+        raise ExecutionError("could not read the venue's instrument list")
+
+    @staticmethod
+    def unpriceable(symbol):
+        # Raises rather than stubs a price: the sizing rehearsal then skips
+        # itself, which is the behaviour for an unavailable market read and
+        # keeps these tests off the network.
+        raise ExecutionError("cannot price")
+
+    def events(self, agent) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in self.journal_path.read_text().splitlines()
+            if line
+        ]
+
+    def test_a_failing_preflight_stops_a_run_with_nothing_open(self):
+        agent = self.make_agent()
+        agent.broker.cache_venue_metadata = self.unreachable
+        agent.run_cycle = lambda: None
+
+        agent.run(max_cycles=1)
+
+        self.assertEqual(agent.stats.cycles, 0, "no cycle should have run")
+        self.assertTrue(agent.halted)
+
+    def test_an_open_position_is_still_managed_when_the_preflight_fails(self):
+        """The one exception. Refusing to start would abandon exposure the agent
+        still has, which is worse than anything this check tests for."""
+        agent = self.make_agent()
+        agent.position = Position(
+            symbol="BTC",
+            side="long",
+            size=0.01,
+            entry_price=50_000.0,
+            notional=500.0,
+            leverage=2,
+        )
+        agent.broker.cache_venue_metadata = self.unreachable
+        agent.run_cycle = lambda: None
+
+        agent.run(max_cycles=1)
+
+        self.assertEqual(agent.stats.cycles, 1, "the exit path must still run")
+        self.assertIsNotNone(agent.position, "the position must stay tracked")
+        self.assertFalse(agent.halted)
+
+    def test_a_clean_preflight_is_journalled(self):
+        agent = self.make_agent()
+        agent.broker._cache_sz_decimals({"universe": [{"name": "BTC", "szDecimals": 5}]})
+        agent.broker.cache_venue_metadata = lambda: None
+        agent._mark_price = self.unpriceable
+        agent.run_cycle = lambda: None
+
+        agent.run(max_cycles=1)
+
+        preflight = [e for e in self.events(agent) if e.get("kind") == "preflight"]
+        self.assertEqual(len(preflight), 1)
+        self.assertEqual(preflight[0]["sz_decimals"], 5)
+        self.assertEqual(preflight[0]["equity"], 1_000.0)
+        self.assertFalse(preflight[0]["sized"])
 
 
 if __name__ == "__main__":

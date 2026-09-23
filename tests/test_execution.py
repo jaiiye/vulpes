@@ -20,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import agent.execution as execution_module  # noqa: E402
 from agent.config import ConfigError, load_config  # noqa: E402
 from agent.execution import (  # noqa: E402
     Broker,
@@ -29,6 +30,8 @@ from agent.execution import (  # noqa: E402
     RestingOrderOutcome,
     compute_size,
 )
+from agent.http_util import HttpError  # noqa: E402
+from agent.market_data import MAINNET_URL, TESTNET_URL  # noqa: E402
 from agent.synthesizer import Journal  # noqa: E402
 
 CONFIG = """
@@ -1369,6 +1372,100 @@ class TestSimulatedFees(ExecutionValueTestCase):
         data.pop("entry_fee_usd")
 
         self.assertEqual(Position.from_dict(data).entry_fee_usd, 0.0)
+
+
+class TestVenueMetadata(ExecutionValueTestCase):
+    """`szDecimals` must be establishable without the SDK.
+
+    A dry run builds no clients, and `_round_size` falls back to
+    `SIZE_DECIMALS` whenever this cache is empty - which is how a six-decimal
+    size reached a five-decimal venue and came back `Order has invalid size.`,
+    while the agent logged `order rejected: 0.0`.
+    """
+
+    def metadata_broker(self):
+        return Broker(self.cfg, None, self.journal)
+
+    def test_the_cache_is_keyed_by_upper_case_symbol(self):
+        broker = self.metadata_broker()
+
+        broker._cache_sz_decimals({"universe": [{"name": "btc", "szDecimals": 5}]})
+
+        self.assertEqual(broker._sz_decimals, {"BTC": 5})
+        self.assertEqual(broker.size_decimals("btc"), 5)
+        self.assertEqual(broker.size_decimals("BTC"), 5)
+
+    def test_an_uncached_symbol_reads_as_unknown_not_as_the_fallback(self):
+        """'the venue's granularity is unknown' and 'it is six' are different
+        facts, and only the first should stop a start-up."""
+        broker = self.metadata_broker()
+
+        self.assertIsNone(broker.size_decimals("BTC"))
+
+    def test_a_payload_without_sz_decimals_uses_the_documented_default(self):
+        broker = self.metadata_broker()
+
+        broker._cache_sz_decimals({"universe": [{"name": "XYZ"}]})
+
+        self.assertEqual(broker.size_decimals("XYZ"), Broker.SIZE_DECIMALS)
+
+    def test_the_read_targets_the_venue_orders_would_go_to(self):
+        """One derivation of the base URL, shared with the SDK build: two that
+        disagreed would read one venue's instrument list and order on another."""
+        captured = {}
+
+        def fake_request(url, payload=None, **kwargs):
+            captured["url"] = url
+            captured["payload"] = payload
+            return {"universe": [{"name": "BTC", "szDecimals": 5}]}
+
+        original = execution_module.request_json
+        execution_module.request_json = fake_request
+        self.addCleanup(lambda: setattr(execution_module, "request_json", original))
+        broker = self.metadata_broker()
+
+        broker.cache_venue_metadata()
+
+        self.assertEqual(captured["url"], f"{TESTNET_URL}/info")
+        self.assertEqual(captured["payload"], {"type": "meta"})
+        self.assertEqual(broker.size_decimals("BTC"), 5)
+
+    def test_a_failed_read_is_an_execution_error(self):
+        """So the preflight can turn it into a refusal. Anything else would
+        escape the handlers that know how to degrade."""
+        original = execution_module.request_json
+
+        def boom(*args, **kwargs):
+            raise HttpError("venue unreachable")
+
+        execution_module.request_json = boom
+        self.addCleanup(lambda: setattr(execution_module, "request_json", original))
+
+        with self.assertRaises(ExecutionError) as ctx:
+            self.metadata_broker().cache_venue_metadata()
+
+        self.assertIn("instrument list", str(ctx.exception))
+        self.assertIn("venue unreachable", str(ctx.exception))
+
+
+class TestRoutingBaseUrl(ExecutionValueTestCase):
+    """The base URL is derived in one place, for orders and for metadata."""
+
+    def test_testnet_uses_the_testnet_url(self):
+        self.assertEqual(Broker(self.cfg, None, self.journal).routing_base_url, TESTNET_URL)
+
+    def test_mainnet_uses_the_mainnet_url(self):
+        self.cfg.execution.testnet = False
+
+        self.assertEqual(Broker(self.cfg, None, self.journal).routing_base_url, MAINNET_URL)
+
+    def test_an_explicit_override_wins_and_loses_its_trailing_slash(self):
+        """Otherwise every request would carry a doubled separator."""
+        self.cfg.execution.base_url = "https://example.test/"
+
+        self.assertEqual(
+            Broker(self.cfg, None, self.journal).routing_base_url, "https://example.test"
+        )
 
 
 if __name__ == "__main__":

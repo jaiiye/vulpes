@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from .config import BotConfig
 from .discipline import Discipline
 from .execution import (
+    MIN_ORDER_NOTIONAL_USD,
     Broker,
     CriticalExecutionError,
     ExecutionError,
@@ -74,6 +75,132 @@ def entry_line(
         f"  ENTER {action.upper()} {size:.6g} {symbol} @ {price:,.6g} "
         f"(notional ${sizing.notional:,.2f}, risk ${sizing.risk_usd:.2f}{tail})"
     )
+
+
+#: Below this many venue size steps, rounding the size moves it by more than
+#: 5%, and the position that gets placed is not quite the one that was sized.
+MIN_SIZE_STEPS = 10.0
+
+
+@dataclass
+class Preflight:
+    """What the start-up check found, before the first signal.
+
+    `fatal` and `warnings` are separate because they call for different things:
+    a fatal one means the account cannot express a trade at all and the run must
+    not pretend otherwise, while a warning is worth saying out loud and stops
+    nothing.
+    """
+
+    equity: float = 0.0
+    #: The sized trade when `compute_size` could run, otherwise the allocation
+    #: cap - which is an upper bound on it rather than the same figure.
+    expected_notional_usd: float = 0.0
+    cap_notional_usd: float = 0.0
+    sz_decimals: int | None = None
+    sized: bool = False
+    fatal: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.fatal
+
+
+def preflight_check(
+    cfg: BotConfig,
+    equity: float,
+    sz_decimals: int | None,
+    sizing: SizingResult | None = None,
+    price: float | None = None,
+) -> Preflight:
+    """Decide whether this account can express the configured trade.
+
+    Both fatal checks are incidents that already happened, not hypotheticals:
+
+    - `0.000121` BTC reached a venue that accepts five decimals and came back
+      `Order has invalid size.` - while the agent logged `order rejected: 0.0`,
+      because the refusal text was being dropped on the floor. The cause was
+      `_round_size` falling back to six decimals while the venue's `szDecimals`
+      went uncached, so "is it cached" is a fact worth establishing before the
+      first order rather than during it.
+    - `Order must have minimum value of $10. asset=3` arrived as a generic
+      `ORDER FAILED` on every signal, for an account whose allocation budget sat
+      under the venue's floor. The arithmetic was never the problem; not knowing
+      it before the run was.
+
+    The fatal notional check uses the allocation **cap**, not a sized position,
+    and that is deliberate: the cap bounds every position this configuration can
+    place, so "cap below the minimum" proves no trade can be expressed - with no
+    market read and therefore no chance of a transient failure producing a false
+    verdict. The exact sizing is reported when it is available, and warns rather
+    than stops, because it rests on a price and an ATR read at that moment.
+
+    `sizing` is the output of the same `compute_size` the live path uses, not a
+    reimplementation of it: two derivations of one domain quantity is the
+    mistake `liquid_split` documents.
+    """
+    risk = cfg.risk
+    out = Preflight(equity=equity, sz_decimals=sz_decimals)
+
+    if sz_decimals is None:
+        out.fatal.append(
+            f"{cfg.symbol}: the venue's size granularity is unknown, so a size "
+            f"would be rounded with the fallback of {Broker.SIZE_DECIMALS} "
+            f"decimals. Measured: that is exactly how 0.000121 BTC was sent to "
+            f"a venue that accepts 5, and the venue answered "
+            f"`Order has invalid size.`"
+        )
+
+    if equity <= 0:
+        out.fatal.append(
+            f"equity reads {equity:,.2f}; there is nothing to size a position from"
+        )
+
+    cap_usd = equity * risk.account_allocation_pct / 100.0
+    if risk.max_position_usd > 0:
+        cap_usd = min(cap_usd, risk.max_position_usd)
+    out.cap_notional_usd = max(cap_usd, 0.0)
+
+    if cap_usd < MIN_ORDER_NOTIONAL_USD:
+        out.fatal.append(
+            f"the most this configuration can place is ${cap_usd:,.2f} of "
+            f"notional ({risk.account_allocation_pct:g}% of ${equity:,.2f}), "
+            f"under the venue's ${MIN_ORDER_NOTIONAL_USD:,.0f} minimum order "
+            f"value, so every signal would be refused before it was ever sent. "
+            f"Raise risk.account_allocation_pct, or fund the account further."
+        )
+
+    out.expected_notional_usd = out.cap_notional_usd
+    if sizing is not None:
+        out.sized = True
+        out.expected_notional_usd = max(sizing.notional, 0.0)
+        # Only when the cap clears the minimum: this warning exists to say "the
+        # cap is fine but the size that actually comes out is not", and when the
+        # cap is under the floor too, that case is already fatal - saying
+        # "clears it" about a cap that does not clear it would be false.
+        if 0 < sizing.notional < MIN_ORDER_NOTIONAL_USD <= cap_usd:
+            out.warnings.append(
+                f"the position sized right now is ${sizing.notional:,.2f}, under "
+                f"the venue's ${MIN_ORDER_NOTIONAL_USD:,.0f} minimum, even though "
+                f"the allocation cap (${cap_usd:,.2f}) clears it. This one rests "
+                f"on the ATR read at start-up and is a warning rather than a "
+                f"refusal for that reason."
+            )
+
+    if price and price > 0 and sz_decimals is not None and out.expected_notional_usd > 0:
+        step = 10.0 ** (-sz_decimals)
+        size = out.expected_notional_usd / price
+        steps = size / step
+        if steps < MIN_SIZE_STEPS:
+            out.warnings.append(
+                f"a ${out.expected_notional_usd:,.2f} position is {size:.6g} "
+                f"{cfg.symbol}, only {steps:.1f} x the venue's size step "
+                f"{step:.6g}; rounding can move it by up to "
+                f"{50.0 / max(steps, 1e-9):.0f}%"
+            )
+
+    return out
 
 
 @dataclass
@@ -213,6 +340,77 @@ class FoxAgent:
     # ------------------------------------------------------------------
     # Startup reconciliation
     # ------------------------------------------------------------------
+    def preflight(self) -> None:
+        """Establish, before the first signal, that a trade can be expressed.
+
+        Runs after reconciliation and before the loop, because both failures it
+        catches were previously discovered by watching a run do the wrong thing
+        over and over: an account too small for the venue's minimum logged
+        `ORDER FAILED` on every single signal, and an uncached `szDecimals` put
+        a six-decimal size on the wire. Neither is visible in the cycle log
+        until it has already happened.
+
+        Raises `CriticalExecutionError` when the account cannot trade at all.
+        What that means when a position is already open is the caller's
+        decision - see `run`.
+        """
+        try:
+            self.broker.cache_venue_metadata()
+        except ExecutionError as exc:
+            raise CriticalExecutionError(f"preflight: {exc}") from exc
+
+        try:
+            equity = self.broker.account_equity()
+        except ExecutionError as exc:
+            raise CriticalExecutionError(
+                f"preflight: could not establish the account size: {exc}"
+            ) from exc
+
+        # Best effort, both of them. An unavailable price must not refuse a
+        # start-up: a data blip is not a reason to refuse to run, and the cycle
+        # already degrades honestly when it cannot price the symbol.
+        price: float | None = None
+        sizing: SizingResult | None = None
+        try:
+            price = self._mark_price(self.cfg.symbol)
+            # The side only moves where the stop and the target land, not the
+            # size, so either one answers the question asked here.
+            sizing = compute_size(
+                self.data_market, self.cfg, self.cfg.symbol, LONG, price, equity
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory: the check survives without it
+            self.log(f"  preflight: sizing could not be rehearsed ({exc})")
+
+        result = preflight_check(
+            self.cfg,
+            equity,
+            self.broker.size_decimals(self.cfg.symbol),
+            sizing=sizing,
+            price=price,
+        )
+        self.log(
+            f"preflight: {self.cfg.symbol} equity ${result.equity:,.2f} | "
+            f"next trade ~${result.expected_notional_usd:,.2f}"
+            f"{'' if result.sized else ' (allocation cap)'} | venue min "
+            f"${MIN_ORDER_NOTIONAL_USD:,.0f} | szDecimals "
+            f"{result.sz_decimals if result.sz_decimals is not None else 'unknown'}"
+        )
+        for warning in result.warnings:
+            self.log(f"  preflight warning: {warning}")
+        self.journal.event(
+            "preflight",
+            equity=round(result.equity, 2),
+            expected_notional_usd=round(result.expected_notional_usd, 2),
+            cap_notional_usd=round(result.cap_notional_usd, 2),
+            sized=result.sized,
+            sz_decimals=result.sz_decimals,
+            warnings=list(result.warnings),
+        )
+        if not result.ok:
+            for problem in result.fatal:
+                self.log(f"  PREFLIGHT FAILED: {problem}")
+            raise CriticalExecutionError("; ".join(result.fatal))
+
     def reconcile_startup(self) -> None:
         """Align tracked state with the exchange before any trading happens.
 
@@ -424,6 +622,26 @@ class FoxAgent:
                 f"running in exit-only mode to manage the existing position: "
                 f"{self.halt_reason}"
             )
+
+        try:
+            self.preflight()
+        except CriticalExecutionError as exc:
+            if self.position is not None:
+                # Managing an open position is the one job that has to survive a
+                # configuration problem: refusing to start here would abandon
+                # exposure the agent still has, which is worse than any of the
+                # conditions this check exists to catch.
+                self.log(
+                    f"PREFLIGHT FAILED (continuing to manage the open position): {exc}"
+                )
+                self.journal.event("warn", message=f"preflight failed: {exc}")
+            else:
+                # `halt` logs the reason itself, and `preflight` already logged
+                # the per-check detail. Printing the joined message a third time
+                # buried the detail rather than emphasising it.
+                self.halt(str(exc))
+                self.log(self.stats.summary())
+                return self.stats
 
         try:
             while max_cycles is None or self.stats.cycles < max_cycles:
