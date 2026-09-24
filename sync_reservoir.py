@@ -97,6 +97,20 @@ class SyncTarget:
         raise ValueError(f"unknown column mode {mode!r}")
 
 
+#: Columns that exist only in the later part of the archive, and so cannot be
+#: projected. Measured by reading each day's own footer on 2026-09-25:
+#:
+#:     2025-08-01 .. 2026-03-19   27 columns
+#:     2026-06-01 .. 2026-09-20   29 columns   <- adds these two
+#:
+#: A COPY that names a column the day does not have fails on that day, and
+#: `wide` named both - so 235 of 423 days failed with a binder error while every
+#: column-set test passed, because `REAL_SCHEMAS` records **one** day's schema
+#: and the archive's schema is not constant. Neither column is worth that: both
+#: are breakdowns of the fee, and `fee` is already the total.
+COLUMNS_ADDED_MID_ARCHIVE = ("deployer_fee", "priority_gas")
+
+
 SYNC_TARGETS: tuple[SyncTarget, ...] = (
     SyncTarget(
         name="positions",
@@ -147,7 +161,7 @@ SYNC_TARGETS: tuple[SyncTarget, ...] = (
             "quote_symbol", "asset_class", "dex", "price", "size", "side",
             "direction", "fee", "fee_token", "start_position", "crossed",
             "is_liquidation", "liquidation_mark_px", "liquidation_method",
-            "builder_fee", "deployer_fee", "priority_gas",
+            "builder_fee",
         ),
         flow=(
             "address", "timestamp", "realized_pnl",
@@ -636,8 +650,18 @@ def run_copy(sql: str, env: dict[str, str], timeout: int = DEFAULT_COPY_TIMEOUT,
 
         if proc.returncode == 0:
             return
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
-        last = detail[-1] if detail else "no output"
+        # The **first** non-empty line, not the last. DuckDB prints the message
+        # first and then echoes the statement with a caret under the offending
+        # token, so the last line is usually the caret - which is how a binder
+        # error over 235 days was reported as
+        # `duckdb failed after 1 attempts:                     ^` and cost a
+        # detour through the remote schema to identify.
+        detail = [
+            line.strip()
+            for line in (proc.stderr or proc.stdout).strip().splitlines()
+            if line.strip()
+        ]
+        last = detail[0] if detail else "no output"
         if attempt < attempts:
             time.sleep(5 * attempt)
     raise SyncError(f"duckdb failed after {attempts} attempts: {last}")

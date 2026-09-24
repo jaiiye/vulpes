@@ -643,5 +643,68 @@ class TestCopySettings(unittest.TestCase):
         self.assertEqual(seen["workers"], 2)
 
 
+class TestArchiveSchemaVariance(unittest.TestCase):
+    """A column set has to fit every day in the archive, not just today's.
+
+    `REAL_SCHEMAS` is read from a single object, so it validates the *names* and
+    says nothing about whether a name exists on 2025-08-01. Two do not, and
+    `wide` included both until 2026-09-25: 235 of 423 days failed with a binder
+    error while every column-set test passed.
+    """
+
+    def test_no_column_set_projects_a_late_addition(self):
+        from sync_reservoir import COLUMNS_ADDED_MID_ARCHIVE, SYNC_TARGETS
+
+        for target in SYNC_TARGETS:
+            for mode in ("research", "flow", "wide"):
+                try:
+                    columns = target.columns_for(mode)
+                except ValueError:
+                    continue
+                with self.subTest(dataset=target.name, mode=mode):
+                    for column in COLUMNS_ADDED_MID_ARCHIVE:
+                        self.assertNotIn(column, columns)
+
+    def test_the_late_additions_are_real_columns_we_are_choosing_to_skip(self):
+        """Stated separately so the exclusion reads as a measured choice rather
+        than an oversight: they exist, they are just not on every day."""
+        from sync_reservoir import COLUMNS_ADDED_MID_ARCHIVE, TARGETS_BY_NAME
+
+        wide = TARGETS_BY_NAME["fills"].wide
+        for column in COLUMNS_ADDED_MID_ARCHIVE:
+            self.assertIn(column, REAL_SCHEMAS["fills"], "still a real column")
+            self.assertNotIn(column, wide, "but absent before 2026-06")
+
+
+class TestDuckdbErrorReporting(unittest.TestCase):
+    """The message has to survive, because it is the entire diagnosis.
+
+    A binder error affecting 235 days surfaced as
+    `duckdb failed after 1 attempts:                        ^`: `run_copy` took
+    the last line of stderr, and DuckDB prints the message first and the caret
+    under the offending token last.
+    """
+
+    def test_the_message_is_reported_not_the_caret(self):
+        from unittest import mock
+
+        import sync_reservoir as module
+
+        stderr = (
+            'Binder Error: Referenced column "deployer_fee" not found in FROM '
+            "clause!\n\nLINE 3:   deployer_fee\n                    ^\n"
+        )
+        proc = mock.Mock(returncode=1, stdout="", stderr=stderr)
+
+        with mock.patch.object(module.subprocess, "run", lambda *a, **k: proc):
+            with self.assertRaises(module.SyncError) as ctx:
+                module.run_copy("SELECT 1;", env={}, attempts=1)
+
+        message = str(ctx.exception)
+        self.assertIn("Binder Error", message)
+        self.assertIn("deployer_fee", message)
+        self.assertFalse(message.rstrip().endswith("^"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
