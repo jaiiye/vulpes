@@ -90,6 +90,48 @@ class TestConfiguredColumnsExist(unittest.TestCase):
             with self.subTest(dataset=target.name):
                 self.assertTrue(set(target.research) <= set(target.wide))
 
+    def test_flow_columns_exist(self):
+        for target in SYNC_TARGETS:
+            schema = REAL_SCHEMAS[target.name]
+            for column in target.flow:
+                with self.subTest(dataset=target.name, column=column):
+                    self.assertIn(column, schema)
+
+    def test_flow_sits_between_research_and_wide(self):
+        """`flow` is a middle tier: it adds what the position-flow work needs
+        and nothing else. A column in `flow` but not in `wide` would mean the
+        tiers are not ordered, and a column in research but not in flow would
+        mean the position-flow set silently drops something already in use.
+
+        Only datasets that define a tier are checked: a tier is optional, and
+        the datasets that do not define one keep an empty tuple.
+        """
+        for target in SYNC_TARGETS:
+            if not target.flow:
+                continue
+            with self.subTest(dataset=target.name):
+                self.assertTrue(set(target.research) <= set(target.flow))
+                self.assertTrue(set(target.flow) <= set(target.wide))
+
+    def test_flow_is_meaningfully_cheaper_than_wide(self):
+        """The whole reason the tier exists. `wide` keeps every non-identifier
+        column; `flow` drops `start_position`, which alone is 11.4% of the
+        archive, because it can be reconstructed from `size` + `direction`
+        against the daily position snapshots."""
+        from sync_reservoir import projected_fraction
+
+        fills = TARGETS_BY_NAME["fills"]
+        flow = projected_fraction("fills", fills.columns_for("flow"))
+        wide = projected_fraction("fills", fills.columns_for("wide"))
+        self.assertLess(flow, wide)
+        self.assertNotIn("start_position", fills.columns_for("flow"))
+
+    def test_a_dataset_without_a_flow_set_says_so(self):
+        """No silent fallback: the caller asked for a tier that is not defined
+        for this dataset, and the answer is not "use wide instead"."""
+        with self.assertRaises(ValueError):
+            TARGETS_BY_NAME["candles"].columns_for("flow")
+
     def test_unknown_column_mode_is_rejected(self):
         """No silent fallback to a default set: the cost difference is large."""
         for target in SYNC_TARGETS:
@@ -399,18 +441,53 @@ class TestCopySql(unittest.TestCase):
         )
         self.assertIn("['s3://b/a.parquet', 's3://b/b.parquet']", sql)
 
-    def test_glob_form_reads_one_path(self):
-        """The order book has hundreds of files a day; a list would be huge."""
+    def test_every_selected_market_is_read(self):
+        """The regression, stated directly.
+
+        This replaces `test_glob_form_reads_one_path`, which asserted that the
+        per-market form reads a single path - and passed a wildcard pattern as
+        that path, when the keys actually reaching this function come from a
+        listing and are complete object paths. So the test encoded the wrong
+        assumption and made a live bug invisible: over 282 days,
+        `--symbols BTC,ETH,SOL` wrote BTC alone at 81 MB where three markets
+        are 240 MB. The one-market case looked correct, which is why a
+        single-symbol probe cannot find it.
+        """
         sql = build_copy_sql(
             TARGETS_BY_NAME["orderbook"],
-            ["s3://b/date=*/BTC.parquet"],
+            ["s3://b/date=2026-09-22/BTC.parquet", "s3://b/date=2026-09-22/ETH.parquet"],
             ("block_time_ms", "bids", "asks"),
             Path("out.parquet"),
             glob=True,
         )
-        self.assertIn("read_parquet('s3://b/date=*/BTC.parquet')", sql)
-        # The explicit-list form wraps paths in brackets; the glob form does not.
-        self.assertNotIn("[", sql)
+        self.assertIn("'s3://b/date=2026-09-22/BTC.parquet'", sql)
+        self.assertIn("'s3://b/date=2026-09-22/ETH.parquet'", sql)
+
+    def test_the_market_is_derived_from_the_file_name(self):
+        """The source row has no market in it, only the path does.
+
+        `datalake.orderbook_from_hydromancer` reads `row["symbol"]`: without
+        this column every book normalises to an empty symbol and says nothing.
+        """
+        sql = build_copy_sql(
+            TARGETS_BY_NAME["orderbook"],
+            ["s3://b/date=2026-09-22/BTC.parquet"],
+            ("block_time_ms", "bids", "asks"),
+            Path("out.parquet"),
+            glob=True,
+        )
+        self.assertIn("AS symbol", sql)
+        self.assertIn("filename=true", sql)
+
+    def test_a_projected_dataset_gets_no_derived_market(self):
+        """`symbol` is a property of the file name, so it is added only where
+        the file name is the only place the market appears."""
+        sql = build_copy_sql(
+            self.target(), ["s3://b/a.parquet"], ("coin", "close"),
+            Path("out.parquet"), glob=False,
+        )
+        self.assertNotIn("AS symbol", sql)
+        self.assertNotIn("filename=true", sql)
 
     def test_destination_is_quoted(self):
         sql = build_copy_sql(

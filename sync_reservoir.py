@@ -68,6 +68,17 @@ class SyncTarget:
     #: counterparties. These carry no analytical value and, in `fills`, 57% of
     #: the bytes.
     wide: tuple[str, ...]
+    #: Enough to reconstruct every position change from the fills themselves,
+    #: plus what each trade cost and whether it was a maker or a taker. `wide`
+    #: costs about a third more and is only needed for what `flow` omits.
+    #:
+    #: `start_position` is deliberately left out although it is the single most
+    #: expensive column in the dataset (11.4% of the whole archive, 14.5 GB).
+    #: It is a convenience, not a requirement: `size` plus `direction` accumulate
+    #: into the same series, and the `positions` snapshots already in the store
+    #: supply the daily anchor that makes the accumulation start from a known
+    #: value. Leave the column and every sync of this dataset pays for it.
+    flow: tuple[str, ...] = ()
     #: Set when one day is many files, one per market, selected by path.
     per_symbol_files: bool = False
     #: Optional SQL predicate. Present for completeness; it saves no transfer.
@@ -79,6 +90,10 @@ class SyncTarget:
             return self.research
         if mode == "wide":
             return self.wide
+        if mode == "flow":
+            if not self.flow:
+                raise ValueError(f"{self.name} has no flow column set")
+            return self.flow
         raise ValueError(f"unknown column mode {mode!r}")
 
 
@@ -134,6 +149,11 @@ SYNC_TARGETS: tuple[SyncTarget, ...] = (
             "is_liquidation", "liquidation_mark_px", "liquidation_method",
             "builder_fee", "deployer_fee", "priority_gas",
         ),
+        flow=(
+            "address", "timestamp", "realized_pnl",
+            "coin", "size", "side", "direction", "price",
+            "crossed", "is_liquidation", "fee",
+        ),
         note="76% of the archive; identifiers are 57% of it",
     ),
 )
@@ -187,11 +207,21 @@ COLUMN_BYTES: dict[str, dict[str, int]] = {
     },
 }
 
-# Actual source sizes, summed over every object the archive holds, as reported
-# by a real `--dry-run` on 2026-09-18. These are totals, not the per-day sample
-# multiplied out, and they came in lower than that extrapolation did - so the
-# earlier figures were pessimistic. Kept here so the projection's effect on the
-# whole archive can be asserted without touching the network.
+# Actual source sizes, as reported by a real `--dry-run` on 2026-09-18. These
+# are totals, not the per-day sample multiplied out, and they came in lower than
+# that extrapolation did - so the earlier figures were pessimistic. Kept here so
+# the projection's effect on the archive can be asserted without touching the
+# network.
+#
+# `orderbook` is the one exception to "every object the archive holds": it is
+# the size of the **default three symbols**, not of the dataset. `plan_dataset`
+# drops every object whose file name is not in `--symbols` before summing, so
+# this figure is BTC+ETH+SOL, and the whole dataset is 178 markets a day -
+# measured by listing the prefix on 2026-09-24: 51,841 objects over 282 days,
+# 13.7 GB. The distinction matters because 0.31 GB reads as "this dataset is
+# nearly free", which is true only for three markets; taking all of them is
+# 44 times that and would not fit the egress allowance alongside a wide fills
+# sync. Every other figure here is the whole dataset.
 MEASURED_SOURCE_GB: dict[str, float] = {
     "positions": 5.09,
     "candles": 10.68,
@@ -491,12 +521,32 @@ def build_copy_sql(
     glob: bool,
 ) -> str:
     """A projection-only COPY. Aggregation belongs to a later stage."""
+    listed = ", ".join(f"'{k}'" for k in keys)
     if glob:
-        # A per-market dataset such as the order book: one glob replaces the
-        # explicit list, which would be hundreds of paths long.
-        source = f"read_parquet('{keys[0]}')"
+        # A per-market dataset such as the order book. Two things about this
+        # are not obvious, and the first version got both wrong.
+        #
+        # **Every selected key has to be read.** It used to read `keys[0]`
+        # alone, on the stated reasoning that "one glob replaces the explicit
+        # list" - but the keys come from a listing and are complete object
+        # paths, so that is not a glob: it reads exactly one market. Measured
+        # over 282 days, `--symbols BTC,ETH,SOL` wrote BTC alone at 81 MB where
+        # all three markets are 240 MB, with no error and no warning. The
+        # single-symbol case looks correct, which is why a probe with one
+        # symbol cannot find this.
+        #
+        # **The market has to be materialised as a column.** The source
+        # carries only `block_time_ms/block_number/bids/asks`; the market is
+        # in the file name. Without it a day-file holding three markets is
+        # three unidentified books, and `datalake.orderbook_from_hydromancer`
+        # reads `row["symbol"]` - so every book would normalise to an empty
+        # symbol and report nothing about it.
+        source = f"read_parquet([{listed}], filename=true)"
+        columns = (
+            "regexp_extract(filename, '/([^/]+)\\.parquet$', 1) AS symbol",
+            *columns,
+        )
     else:
-        listed = ", ".join(f"'{k}'" for k in keys)
         source = f"read_parquet([{listed}])"
 
     cols = ", ".join(columns)
@@ -774,9 +824,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--columns",
-        choices=("research", "wide"),
+        choices=("research", "wide", "flow"),
         default="research",
         help="research: only what a backtest needs today (default, cheapest). "
+             "flow: enough to reconstruct position changes from the fills, plus "
+             "what each trade cost and maker/taker. "
              "wide: also keep everything except identifier columns",
     )
     p.add_argument(

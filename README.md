@@ -4465,6 +4465,92 @@ OI 不做合并进聪明钱因子：**钱包和聚合是两个族**，值得问�
 
 ---
 
+## 第十四轮：补取历史数据（以及一处静默丢币的 bug）
+
+起点是一个合理的怀疑：**归档当时是不是只取了部分数据？** 是，而且是**按列刻意取的**。
+`sync_reservoir.py` 每个数据集有两份列清单（`research` / `wide`），注释写明动机：
+`fills` 里「identifiers are 57% of it」。实际取了 `research`：
+
+| 数据集 | 源列数 | 取了 | 说明 |
+|---|---|---|---|
+| `fills` | **22** | **3** | 只有 `address`/`timestamp`/`realized_pnl` |
+| `positions` | 11 | 5 | 缺 `liquidation_price`/`leverage`/`funding_pnl`/`account_value` |
+| `candles` | 13 | 7 | — |
+| `orderbook` / `account_values` / `funding` | — | **0** | 从未同步 |
+
+### 真实清单（`--dry-run` 实测）
+
+```
+  dataset           to fetch   have        source      transfer
+  positions                5    364       0.10 GB       0.07 GB
+  candles                  5    414       0.20 GB       0.15 GB
+  orderbook              282      0       0.31 GB       0.31 GB
+  account_values         369      0      16.18 GB      15.79 GB
+  fills                    5    417       2.67 GB       0.30 GB
+```
+
+### 一处静默丢币的 bug（已修）
+
+`build_copy_sql` 的 per-market 分支只读了 `keys[0]`，理由写的是「one glob replaces the
+explicit list」—— **但那不是 glob**：`keys` 来自列表接口，是完整对象路径。后果实测：
+
+```
+--symbols BTC,ETH,SOL × 282 天  ->  只写入 BTC
+  文件 81 MB（三个市场应为 240 MB），无报错、无警告
+```
+
+**单币种不会触发这个分支**，所以拿一个币做探针永远发现不了它。
+
+而现有测试**把错误行为写成了断言**：`test_glob_form_reads_one_path` 传的是
+`date=*/BTC.parquet` 这种通配符模式，生产里根本不会出现 —— 测试照着那条错注释写，
+而不是照着真实输入写。已替换为直接断言「每个选中的市场都被读」+「币种由文件名派生」。
+
+**另外必须派生 `symbol` 列**：源文件只有 4 列，币种在文件名里，而
+`datalake.orderbook_from_hydromancer` 读 `row["symbol"]` —— 缺这一列会让每个 book
+都归成空 symbol 且不报告。修后实测：`SOL $116 / ETH $2,720 / BTC $86k`，三币齐全 ✓。
+
+### 新增 `--columns flow`（fills 的仓位流）
+
+`wide` 保留了全部非标识列，但对仓位重建而言过剩。新的 `flow` 档：
+
+```
+research   11.2%   14.31 GB
+flow       29.5%   37.61 GB   <- 新增
+wide       42.9%   54.70 GB
+```
+
+**刻意不收 `start_position`** —— 它是全档最贵的一列（11.4%，14.54 GB），但它只是便利：
+`size` + `direction` 可以累积出同一条序列，而 `positions` 的日快照已经提供了锚点。
+
+### 顺手修的文档错误
+
+`MEASURED_SOURCE_GB` 的注释说它是「summed over every object the archive holds」，
+但对 `orderbook` 那 0.31 GB **不对**：`plan_dataset` 会先按 `DEFAULT_SYMBOLS` 过滤再求和，
+所以那是**默认 3 币**的数字。实测整个数据集是 **51,841 个对象 / 184 币 / 13.7 GB**（44 倍）。
+这个区别要紧：0.31 GB 读起来像「这个数据集几乎免费」，而那只对三个币成立。
+
+### ⚠ 一个实测出来的硬约束：egress 只有约 0.85 GB/小时
+
+```
+② positions wide      4.36 GB   ->  约  5.1 小时
+③ fills flow         37.61 GB   ->  约 44.2 小时
+③ 精简（去 fee/price） 22.78 GB   ->  约 26.8 小时
+```
+
+这是从 requester-pays 桶拉取的实测速率（581 MB / 41 分钟）。它把「还剩多少数据可拿」
+从「几次命令」变成了「几天」—— 所以 ③ 需要单独决策，不能顺手启动。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| 测试 | **974 通过**（新增 6 条） |
+| orderbook | 282 天 × 3 币 = 246 MB；每天 1435 个分钟快照、每档 20 层 ✓ |
+| 币种可辨识 | `SOL $116 / ETH $2,720 / BTC $86k` ✓ |
+| 测试缺陷 | 旧测试断言了 bug 行为，已连带替换 |
+
+---
+
 ## 风险声明
 
 永续合约交易存在重大亏损风险。本代码基于公开的开源方案与一篇 22-Agent 实盘实验报告构建，
