@@ -4613,12 +4613,24 @@ API），所以暂停期间**没有任何东西会消耗这个额度** ✓。
 
 ### 恢复配方（下个月）
 
+超时与重试已改成参数（见下），所以恢复是一条命令：
+
 ```bash
-# 1) 先放开 run_copy 的超时：默认 600 s 是硬编码的，不改则大的日子永远超时
-# 2) 再同步，--workers 必须留在 4
 python3 sync_reservoir.py --datasets fills --columns flow \
-    --store data/flow_new --workers 4 --profile s3reader
+    --store data/flow_new --workers 4 \
+    --copy-timeout 3600 --copy-attempts 2 --profile s3reader
 ```
+
+三个值都不能省：
+
+- **`--copy-timeout 3600`** —— 默认 600 s 乘以单日流速率（~0.06 MB/s）只有 ~36 MB，
+  而 fills 平均 93 MB/天，所以用默认值时**每一天都超时**（实测 228 天全部失败、
+  每次重试 3 遍）。超时既是「卡死保护」也是**吞吐上限**，这两件事以前没人分开看。
+- **`--copy-attempts 2`** —— 重试把字节乘上去；一个注定失败的日子，重试 3 次就是付 3 倍。
+- **`--workers 4`** —— 实测 12 比 4 慢 2.8 倍。
+
+改完后 `--workers` 的帮助文本也一并更正了：它原本写着「close to a linear speedup」，
+而实测是 12 路比 4 路慢，并且所有流会同时落进同一个超时窗口一起失败。
 
 | 列集 | 代价 | 约 0.85 GB/h |
 |---|---|---|

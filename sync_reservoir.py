@@ -557,14 +557,43 @@ def build_copy_sql(
     )
 
 
-def run_copy(sql: str, env: dict[str, str], timeout: int = 600,
-             attempts: int = 3, threads: int = DUCKDB_THREADS) -> None:
+#: Seconds allowed for one day's COPY. Dataset-dependent, and the default is
+#: wrong for the largest one.
+#:
+#: The timeout does two jobs and they pull in opposite directions. It is what
+#: keeps a long run moving past a stalled read - one such stall held a COPY open
+#: for minutes writing nothing. But multiplied by this link's per-stream rate it
+#: is also a **ceiling on how large a day can ever succeed**:
+#:
+#:     bandwidth per day-stream   ~0.06 MB/s  (measured, 4 workers)
+#:     600 s x 0.06 MB/s          ~36 MB      <- the largest day that can finish
+#:     fills flow projection      ~93 MB/day  (average)
+#:
+#: Every fills day is larger than that, so all of them timed out - 228 days,
+#: each retried three times, over a day of transfer that wrote nothing and
+#: pulled the same bytes three times over. Raise this for `fills`; leave it for
+#: the small datasets, where a hang is the likelier failure than a slow success.
+DEFAULT_COPY_TIMEOUT = 600
+
+#: Retries per day. Multiplied by the timeout this sets the worst case for one
+#: day, and for a day that cannot succeed it is pure waste - so it is worth
+#: lowering when the timeout is already generous enough that a failure means
+#: something else went wrong.
+DEFAULT_COPY_ATTEMPTS = 3
+
+
+def run_copy(sql: str, env: dict[str, str], timeout: int = DEFAULT_COPY_TIMEOUT,
+             attempts: int = DEFAULT_COPY_ATTEMPTS,
+             threads: int = DUCKDB_THREADS) -> None:
     """Run one projection COPY, with a timeout and a retry.
 
     A stalled read is routine on this link and DuckDB will sit on it
     indefinitely - one such stall held a COPY open for minutes while writing
     nothing. Without a timeout the whole backfill stops behind a single hung
     subprocess, so the timeout is the thing that keeps a 364-day run moving.
+
+    It is also a throughput ceiling; see `DEFAULT_COPY_TIMEOUT` for the
+    arithmetic and for why `fills` needs a larger one.
 
     `threads` is per DuckDB process, and the caller scales it down as the
     number of concurrent processes goes up. Left fixed it oversubscribes: eight
@@ -726,6 +755,8 @@ def sync_dataset(
     env: dict[str, str],
     dry_run: bool,
     workers: int = 1,
+    copy_timeout: int = DEFAULT_COPY_TIMEOUT,
+    copy_attempts: int = DEFAULT_COPY_ATTEMPTS,
 ) -> int:
     """Fetch every pending day, optionally several at a time.
 
@@ -738,6 +769,12 @@ def sync_dataset(
     seconds the link is idle. Overlapping days occupies it.
 
     Concurrency does not change the byte count, so it does not change the bill.
+
+    It can, however, make it *slower*, which the help text for `--workers` did
+    not say until it was measured: on the fills dataset twelve concurrent days
+    moved 0.30 GB/h where four moved 0.85 GB/h. Beyond some point the streams
+    congest each other, and every one of them is then inside the per-day timeout
+    at once, so they all fail together.
     """
     out_dir = store / plan.target.name
     total = len(plan.days)
@@ -771,7 +808,13 @@ def sync_dataset(
             glob=glob,
         )
         try:
-            run_copy(sql, env, threads=per_process)
+            run_copy(
+                sql,
+                env,
+                timeout=copy_timeout,
+                attempts=copy_attempts,
+                threads=per_process,
+            )
         except SyncError as exc:
             print(f"    {plan.target.name} {day.date}: FAILED: {exc}",
                   file=sys.stderr)
@@ -854,13 +897,36 @@ def build_parser() -> argparse.ArgumentParser:
              "profile fails with a message that names the ones that do exist.",
     )
     p.add_argument(
+        "--copy-timeout",
+        type=int,
+        default=DEFAULT_COPY_TIMEOUT,
+        metavar="SECONDS",
+        help=f"seconds allowed for one day's COPY (default "
+             f"{DEFAULT_COPY_TIMEOUT}). Raise it for `fills`: multiplied by the "
+             f"per-stream rate this is a ceiling on how large a day can ever "
+             f"succeed, and the fills projection averages ~93 MB/day against a "
+             f"~36 MB ceiling at the default.",
+    )
+    p.add_argument(
+        "--copy-attempts",
+        type=int,
+        default=DEFAULT_COPY_ATTEMPTS,
+        metavar="N",
+        help=f"retries per day (default {DEFAULT_COPY_ATTEMPTS}). Each retry "
+             f"re-pays the transfer, so a day that cannot succeed costs N times "
+             f"the bytes; lower it when the timeout is already generous.",
+    )
+    p.add_argument(
         "--workers",
         type=int,
         default=4,
         help="days to fetch concurrently (default 4). The transfer is "
              "latency-bound - one day moves ~34 MB in ~45s, most of it spent "
-             "waiting on range requests - so overlapping days is close to a "
-             "linear speedup. Bytes billed are unchanged.",
+             "waiting on range requests - so overlapping days helps. It does "
+             "NOT scale with the count: measured on the fills dataset, 12 days "
+             "concurrently moved 0.30 GB/h where 4 moved 0.85 GB/h, and every "
+             "stream was then inside the same per-day timeout, so they timed "
+             "out together. Bytes billed are unchanged either way.",
     )
     return p
 
@@ -917,7 +983,14 @@ def main(argv: list[str] | None = None) -> int:
     for plan in plans:
         columns = plan.target.columns_for(args.columns)
         total += sync_dataset(
-            plan, store, columns, env, dry_run=False, workers=args.workers
+            plan,
+            store,
+            columns,
+            env,
+            dry_run=False,
+            workers=args.workers,
+            copy_timeout=args.copy_timeout,
+            copy_attempts=args.copy_attempts,
         )
     print()
     print(f"  wrote {total} day-file(s) under {store}")

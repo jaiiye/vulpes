@@ -497,5 +497,151 @@ class TestCopySql(unittest.TestCase):
         self.assertIn("'/tmp/dir with space/out.parquet'", sql)
 
 
+class TestCopySettings(unittest.TestCase):
+    """The per-day COPY timeout and retry count, and why they became flags.
+
+    Both were hardcoded and neither had a test - which is how a value that made
+    a whole dataset unfetchable stayed in place. The timeout is not only a
+    stall-breaker: multiplied by this link's per-stream rate it is a **ceiling
+    on how large a day can ever succeed**.
+
+        600 s x ~0.06 MB/s   = ~36 MB   <- largest day that can finish
+        fills flow projection = ~93 MB/day
+
+    So all 228 fills days attempted timed out, three retries each, and every
+    retry re-paid the transfer. A day of bandwidth wrote nothing.
+    """
+
+    def test_the_defaults_are_on_the_cli(self):
+        from sync_reservoir import (
+            DEFAULT_COPY_ATTEMPTS,
+            DEFAULT_COPY_TIMEOUT,
+            build_parser,
+        )
+
+        args = build_parser().parse_args([])
+        self.assertEqual(args.copy_timeout, DEFAULT_COPY_TIMEOUT)
+        self.assertEqual(args.copy_attempts, DEFAULT_COPY_ATTEMPTS)
+
+    def test_the_cli_values_reach_the_parser(self):
+        from sync_reservoir import build_parser
+
+        args = build_parser().parse_args(
+            ["--copy-timeout", "3600", "--copy-attempts", "1"]
+        )
+        self.assertEqual(args.copy_timeout, 3600)
+        self.assertEqual(args.copy_attempts, 1)
+
+    def test_the_timeout_reaches_duckdb(self):
+        """A setting that is not passed to the subprocess is not a setting."""
+        from unittest import mock
+
+        import sync_reservoir as module
+
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen.update(kwargs)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(module.subprocess, "run", fake_run):
+            module.run_copy("SELECT 1;", env={}, timeout=2400)
+
+        self.assertEqual(seen["timeout"], 2400)
+
+    def test_the_retry_count_is_the_number_of_attempts(self):
+        from unittest import mock
+
+        import sync_reservoir as module
+
+        calls: list[int] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(1)
+            raise module.subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+        with mock.patch.object(module.subprocess, "run", fake_run):
+            with mock.patch.object(module.time, "sleep"):
+                with self.assertRaises(module.SyncError):
+                    module.run_copy("SELECT 1;", env={}, attempts=2, timeout=1)
+
+        self.assertEqual(len(calls), 2, "attempts is the retry count")
+
+    def test_sync_dataset_forwards_them(self):
+        """The flags are useless if the per-day fetch does not use them."""
+        import tempfile
+        from unittest import mock
+
+        import sync_reservoir as module
+
+        seen: dict = {}
+        plan = module.DatasetPlan(
+            target=module.TARGETS_BY_NAME["candles"],
+            days=[module.DayPlan(date="2026-01-01", source_bytes=10, keys=["k"])],
+        )
+
+        def fake_run_copy(sql, env, **kwargs):
+            seen.update(kwargs)
+            # `fetch` renames only a non-empty staging file into place, and the
+            # destination is the quoted path in the statement.
+            for token in sql.split("'"):
+                if token.endswith(".tmp"):
+                    Path(token).write_bytes(b"x")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(module, "run_copy", fake_run_copy):
+                module.sync_dataset(
+                    plan,
+                    Path(tmp),
+                    ("coin",),
+                    {},
+                    dry_run=False,
+                    copy_timeout=2400,
+                    copy_attempts=1,
+                )
+
+        self.assertEqual(seen["timeout"], 2400)
+        self.assertEqual(seen["attempts"], 1)
+
+    def test_main_passes_the_flags_to_the_sync(self):
+        """The wiring from argv to the per-day fetch.
+
+        Without this the flags can exist, be forwarded correctly by
+        `sync_dataset`, and still do nothing because `main` never handed them
+        over - which is the silent failure this repo keeps finding: every piece
+        is individually right, and the connection between them is not tested.
+        """
+        from unittest import mock
+
+        import sync_reservoir as module
+
+        seen: dict = {}
+        plan = module.DatasetPlan(target=module.TARGETS_BY_NAME["candles"])
+
+        def fake_sync_dataset(plan_, store, columns, env, **kwargs):
+            seen.update(kwargs)
+            return 0
+
+        with mock.patch.object(module, "duckdb_env", lambda profile: {}):
+            with mock.patch.object(module, "plan_dataset", lambda *a, **k: plan):
+                with mock.patch.object(module, "report", lambda *a, **k: 1.0):
+                    with mock.patch.object(
+                        module, "sync_dataset", fake_sync_dataset
+                    ):
+                        rc = module.main(
+                            [
+                                "--datasets", "candles",
+                                "--copy-timeout", "3600",
+                                "--copy-attempts", "1",
+                                "--workers", "2",
+                            ]
+                        )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen["copy_timeout"], 3600)
+        self.assertEqual(seen["copy_attempts"], 1)
+        self.assertEqual(seen["workers"], 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
