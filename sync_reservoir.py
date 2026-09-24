@@ -589,10 +589,17 @@ def build_copy_sql(
 #: the small datasets, where a hang is the likelier failure than a slow success.
 DEFAULT_COPY_TIMEOUT = 600
 
-#: Retries per day. Multiplied by the timeout this sets the worst case for one
-#: day, and for a day that cannot succeed it is pure waste - so it is worth
-#: lowering when the timeout is already generous enough that a failure means
-#: something else went wrong.
+#: Retries per day. What a retry costs is the bytes already moved when it
+#: failed, and that depends entirely on the failure mode rather than on the
+#: timeout: an SSL connect error fails immediately and re-pays nothing, while a
+#: timeout re-pays the whole window.
+#:
+#: So lowering this to save transfer is the wrong instinct once the timeout is
+#: large. The timeout was raised to 3600s precisely so that a timeout stops
+#: meaning "this day is too big", which leaves the immediate failures - and this
+#: link produces them routinely - for the retries to absorb. Measured the hard
+#: way: at `--copy-attempts 1`, three days were lost to SSL errors in a single
+#: batch that one more attempt would have covered.
 DEFAULT_COPY_ATTEMPTS = 3
 
 
@@ -936,9 +943,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_COPY_ATTEMPTS,
         metavar="N",
-        help=f"retries per day (default {DEFAULT_COPY_ATTEMPTS}). Each retry "
-             f"re-pays the transfer, so a day that cannot succeed costs N times "
-             f"the bytes; lower it when the timeout is already generous.",
+        help=f"retries per day (default {DEFAULT_COPY_ATTEMPTS}). A retry "
+             f"re-pays only the bytes moved before it failed, so it is nearly "
+             f"free for an immediate failure (this link raises SSL connect "
+             f"errors routinely) and expensive only for a timeout. Lower it "
+             f"with that difference in mind, not just because the timeout is "
+             f"large.",
     )
     p.add_argument(
         "--workers",
