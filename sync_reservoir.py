@@ -953,14 +953,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--workers",
         type=int,
-        default=4,
-        help="days to fetch concurrently (default 4). The transfer is "
-             "latency-bound - one day moves ~34 MB in ~45s, most of it spent "
-             "waiting on range requests - so overlapping days helps. It does "
-             "NOT scale with the count: measured on the fills dataset, 12 days "
-             "concurrently moved 0.30 GB/h where 4 moved 0.85 GB/h, and every "
-             "stream was then inside the same per-day timeout, so they timed "
-             "out together. Bytes billed are unchanged either way.",
+        default=1,
+        help="days to fetch concurrently (default 1). It was 4, and that was "
+             "wrong: on the fills dataset every measurement points the same "
+             "way, and more concurrency is worse rather than better - 12 days "
+             "moved 0.30 GB/h, 4 moved 0.85 GB/h and failed outright with SSL "
+             "connect errors, while 1 moved 0.9-1.7 GB/h and succeeded. The "
+             "transfer is latency-bound, but the streams also contend for the "
+             "same link, and past a point the losses exceed the gains. Bytes "
+             "billed are unchanged either way.",
     )
     return p
 
