@@ -46,6 +46,12 @@ from backtest.data import (  # noqa: E402
 from backtest.engine import Backtester  # noqa: E402
 from backtest.metrics import MIN_MEANINGFUL_TRADES, Metrics, compute_metrics  # noqa: E402
 from backtest.leaderboard import LeaderboardError, reconstruct  # noqa: E402
+from backtest.fills_history import (  # noqa: E402
+    DEFAULT_FILLS_STORE,
+    DEFAULT_MAX_FILLS_PER_DAY as FILLS_MAX_FILLS_PER_DAY,
+    DEFAULT_MIN_TAKER_RATIO,
+    load_fills_history,
+)
 from backtest.position_history import (  # noqa: E402
     DEFAULT_MAX_AGE_MS as SNAPSHOT_MAX_AGE_MS,
     DEFAULT_STORE as DEFAULT_POSITION_STORE,
@@ -93,6 +99,19 @@ realised PnL - the production selection rule. Remaining gaps: the archive
 lags live by up to a day, and the account-value floor is omitted because that
 column is not in the research projection."""
 
+#: Scope text for a wide-fills-backed run. This is the only arm where the
+#: ranking is per coin and market makers are excluded on measured behaviour,
+#: so the gaps that remain are about the archive rather than about the rule.
+SCOPE_FILLS = """INCLUDED: the smart money factor (40% of the live weight) with the alignment
+gate on. Wallets are ranked by realised PnL **within the traded coin** and
+market makers are excluded by their share of fills that cross the spread -
+neither is expressible from the three-column fills projection, which has no
+coin and no aggressor flag. Positions are rebuilt per fill, so the book no
+longer lags by up to a day. Remaining gaps: no entry price, so the
+wallet-quality confidence term is dropped rather than guessed; realised PnL
+only; and the market-maker cut is a behavioural threshold fitted to the
+measured distribution, not a label the venue publishes."""
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -136,7 +155,30 @@ def build_parser() -> argparse.ArgumentParser:
         "reconstructed ranking. Production applies no such ceiling; it exists "
         "to test whether the factor is only reading market-maker inventory. "
         "Of the wallets entering the PnL top 60, 53%% trade >1000 times a day "
-        "and 86%% more than 200.",
+        "and 86%% more than 200. Defaults to no ceiling on the leaderboard "
+        "path and to the measured cut on the fills path.",
+    )
+    p.add_argument(
+        "--whale-fills",
+        nargs="?",
+        const=DEFAULT_FILLS_STORE,
+        default=None,
+        help="run the 40%% smart money factor from the **wide** fills archive "
+        "in this directory (default: %(const)s). Unlike --whale-leaderboard "
+        "this ranks wallets within the traded coin and can exclude market "
+        "makers by their taker share, and it rebuilds positions per fill "
+        "instead of per daily snapshot. Takes precedence over "
+        "--whale-snapshots when both are given.",
+    )
+    p.add_argument(
+        "--whale-min-taker",
+        type=float,
+        default=None,
+        help="with --whale-fills, drop wallets whose share of fills crossing "
+        f"the spread is below this (default: {DEFAULT_MIN_TAKER_RATIO}, the "
+        "value measured on the archive). Measured medians are 74%% for "
+        "one-coin wallets against 36%% for the 10k+/day quoters, which is "
+        "what separates a directional view from a two-sided quote.",
     )
     p.add_argument(
         "--entry-timeframe",
@@ -243,9 +285,24 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    if not args.whale_snapshots:
+    # Which archive backs the factor, resolved once. The banner, the loader,
+    # the staleness window and the trade dump all have to agree on it, and four
+    # independent tests of the same three flags is how one of them ends up
+    # disagreeing with the other three.
+    if args.whale_fills:
+        whale_source = "fills"
+    elif args.whale_snapshots and args.whale_leaderboard:
+        whale_source = "leaderboard"
+    elif args.whale_snapshots:
+        whale_source = "snapshots"
+    else:
+        whale_source = None
+
+    if whale_source == "fills":
+        scope = SCOPE_FILLS
+    elif whale_source is None:
         scope = SCOPE_NO_WHALES
-    elif args.whale_leaderboard:
+    elif whale_source == "leaderboard":
         scope = SCOPE_LEADERBOARD
     else:
         scope = SCOPE_WHALES
@@ -310,10 +367,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Whale history (optional) --------------------------------------
     whale_histories: dict[str, Any] = {}
-    if args.whale_snapshots:
+    if whale_source:
         print("=== WHALE HISTORY ===")
         board = None
-        if args.whale_leaderboard:
+        if whale_source == "leaderboard":
             progress("reconstructing the leaderboard from fills...")
             try:
                 board = reconstruct(
@@ -328,6 +385,21 @@ def main(argv: list[str] | None = None) -> int:
             for note in board.notes:
                 print(f"    ! {note}")
 
+        # An unset flag means "the module's measured default" on the fills
+        # path and "no ceiling" on the leaderboard one, because production
+        # applies none there. Collapsing the two into a single default would
+        # silently drop the cut that keeps quoters out of a per-coin ranking.
+        fills_ceiling = (
+            FILLS_MAX_FILLS_PER_DAY
+            if args.whale_max_fills_per_day is None
+            else args.whale_max_fills_per_day
+        )
+        taker_floor = (
+            DEFAULT_MIN_TAKER_RATIO
+            if args.whale_min_taker is None
+            else args.whale_min_taker
+        )
+
         for sym in requested:
             dataset = datasets.get(sym)
             # Select wallets from data strictly before the traded window. Using
@@ -339,7 +411,19 @@ def main(argv: list[str] | None = None) -> int:
                 else int(time.time() * 1000) - args.days * 86_400_000
             )
             try:
-                if board is not None:
+                if whale_source == "fills":
+                    progress(
+                        f"ranking {sym} wallets by realised PnL and rebuilding "
+                        "positions from fills..."
+                    )
+                    history = load_fills_history(
+                        market=sym,
+                        store=args.whale_fills,
+                        select_before_ms=window_start_ms,
+                        max_fills_per_day=fills_ceiling,
+                        min_taker_ratio=taker_floor,
+                    )
+                elif board is not None:
                     progress(f"loading positions for {sym} from the ranking...")
                     history = load_leaderboard_history(
                         board, market=sym, store=args.whale_snapshots
@@ -401,10 +485,14 @@ def main(argv: list[str] | None = None) -> int:
             initial_equity=args.equity,
             taker_fee_bps=args.fee_bps,
             whale_history=whale_histories.get(sym),
-            # Daily snapshots, so the staleness window is measured in days.
-            # The engine's default suits hourly funding records and would leave
-            # the whale book empty for all but one bar in twenty-four.
-            whale_max_age_ms=SNAPSHOT_MAX_AGE_MS if args.whale_snapshots else None,
+            # Daily snapshots, so the staleness window is measured in days. The
+            # engine's default suits hourly funding records and would leave the
+            # whale book empty for all but one bar in twenty-four. The fills
+            # path needs neither: its points are per fill, and a wallet that has
+            # not traded recently genuinely has no position to report.
+            whale_max_age_ms=(
+                SNAPSHOT_MAX_AGE_MS if whale_source == "snapshots" else None
+            ),
         ).run(progress=progress)
         metrics = compute_metrics(
             result,
@@ -435,7 +523,7 @@ def main(argv: list[str] | None = None) -> int:
         _report_pooled(runs, datasets, config, dataset_warnings, runtime)
 
     if args.dump_trades:
-        _dump_trades(Path(args.dump_trades), runs, args, config)
+        _dump_trades(Path(args.dump_trades), runs, args, config, whale_source)
 
     return 0
 
@@ -445,21 +533,26 @@ def _dump_trades(
     runs: list[tuple[str, Any, Metrics, Any]],
     args: argparse.Namespace,
     config: Any,
+    whale_source: str | None,
 ) -> None:
     """Write the per-trade results, plus what produced them.
 
     The metadata is not decoration: two arms of one comparison are only
     comparable if they were run over the same window with the same fee, and a
     dump without it cannot be checked for that later.
+
+    `whale_source` is passed rather than re-derived from `args`: it is already
+    resolved once, and a second copy of the same test is exactly how a dump
+    ends up labelling a run that the banner described differently.
     """
-    if not args.whale_snapshots:
-        arm = "no_whales"
-    elif args.whale_leaderboard:
-        arm = "leaderboard"
-    else:
-        arm = "size_selected_whales"
+    arm = {
+        "fills": "fills_ranked_whales",
+        "leaderboard": "leaderboard",
+        "snapshots": "size_selected_whales",
+    }.get(whale_source or "", "no_whales")
     payload = {
         "arm": arm,
+        "whale_source": whale_source,
         "max_fills_per_day": args.whale_max_fills_per_day,
         "symbols": [sym for sym, _, _, _ in runs],
         "days": args.days,
@@ -467,7 +560,7 @@ def _dump_trades(
         "fee_bps": args.fee_bps,
         "equity": args.equity,
         "smart_money_weight": (
-            0.0 if not args.whale_snapshots else config.weights.smart_money
+            0.0 if whale_source is None else config.weights.smart_money
         ),
         "trades": [
             {

@@ -1561,7 +1561,7 @@ class TestTradeDump(unittest.TestCase):
     nothing else, and a dump that mislabels the arm is worse than no dump.
     """
 
-    def _dump(self, **overrides):
+    def _dump(self, whale_source=None, **overrides):
         import json
         import tempfile
         from argparse import Namespace
@@ -1572,7 +1572,9 @@ class TestTradeDump(unittest.TestCase):
         args = Namespace(
             whale_snapshots=None,
             whale_leaderboard=False,
+            whale_fills=None,
             whale_max_fills_per_day=None,
+            whale_min_taker=None,
             days=79,
             as_of="2026-06-15",
             fee_bps=3.5,
@@ -1591,16 +1593,18 @@ class TestTradeDump(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trades.json"
-            _dump_trades(path, runs, args, config)
+            _dump_trades(path, runs, args, config, whale_source)
             return json.loads(path.read_text())
 
     def test_a_weight_zeroed_run_says_so(self):
         payload = self._dump()
         self.assertEqual(payload["arm"], "no_whales")
         self.assertEqual(payload["smart_money_weight"], 0.0)
+        self.assertIsNone(payload["whale_source"])
 
     def test_a_leaderboard_run_records_the_weight_and_the_ceiling(self):
         payload = self._dump(
+            whale_source="leaderboard",
             whale_snapshots="data/canonical/positions",
             whale_leaderboard=True,
             whale_max_fills_per_day=50,
@@ -1608,6 +1612,31 @@ class TestTradeDump(unittest.TestCase):
         self.assertEqual(payload["arm"], "leaderboard")
         self.assertEqual(payload["smart_money_weight"], 0.40)
         self.assertEqual(payload["max_fills_per_day"], 50)
+
+    def test_a_fills_run_is_labelled_apart_from_the_other_two(self):
+        """Three arms all carry the factor, so they have to be separable in the
+        dump: two of them sharing a label would make a comparison between them
+        unverifiable after the fact, which is why the dump exists at all.
+        """
+        payload = self._dump(
+            whale_source="fills", whale_fills="data/fills_wide/fills"
+        )
+        self.assertEqual(payload["arm"], "fills_ranked_whales")
+        self.assertEqual(payload["whale_source"], "fills")
+        self.assertEqual(payload["smart_money_weight"], 0.40)
+
+    def test_the_source_is_taken_from_the_argument_not_re_derived(self):
+        """`args` alone cannot distinguish the arms: the flags say which loader
+        was permitted, not which one ran, and `--whale-fills` wins over the
+        other two. Re-deriving here would let the dump disagree with the banner
+        printed at the start of the same run.
+        """
+        payload = self._dump(
+            whale_source=None,
+            whale_snapshots="data/canonical/positions",
+            whale_fills="data/fills_wide/fills",
+        )
+        self.assertEqual(payload["arm"], "no_whales")
 
     def test_the_window_is_recorded_so_two_dumps_can_be_checked_for_it(self):
         """Two arms are only comparable if they ran the same window; without

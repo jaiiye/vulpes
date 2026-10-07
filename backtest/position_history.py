@@ -144,9 +144,14 @@ def _run_sql(sql: str, timeout: int = 900) -> list[dict]:
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip().splitlines()
-        raise PositionHistoryError(
-            f"duckdb failed: {detail[-1] if detail else 'no output'}"
+        # The first non-empty line, not the last. A DuckDB binder error ends
+        # with a caret pointing at the offending token, so `detail[-1]` reports
+        # "^" and throws away the sentence that says what was wrong - which is
+        # how a real query error looked like an unexplained failure.
+        message = next(
+            (line.strip() for line in detail if line.strip()), "no output"
         )
+        raise PositionHistoryError(f"duckdb failed: {message}")
     text = proc.stdout.strip()
     if not text:
         return []
@@ -192,12 +197,17 @@ def load_position_history(
     glob = str(root / "*.parquet")
     symbol = market.upper()
 
+    # `filename=true` rather than a positional rename. `AS t(user, market, ...)`
+    # binds names to columns *by position*, so widening the synced column set
+    # silently moved `filename` onto `liquidation_price` and the day extraction
+    # became `regexp_extract(DOUBLE, ...)`. Naming columns explicitly survives
+    # the archive growing, which it does.
     sql = f"""
 WITH p AS (
     SELECT user,
            regexp_extract(filename, 'date=(\\d{{4}}-\\d{{2}}-\\d{{2}})', 1) AS day,
            size, notional, entry_price
-    FROM read_parquet('{glob}') AS t(user, market, size, notional, entry_price, filename)
+    FROM read_parquet('{glob}', filename=true)
     WHERE market = '{symbol}' AND size <> 0
 ),
 eligible AS (
@@ -337,7 +347,7 @@ def load_leaderboard_history(
 SELECT lower(user) AS wallet,
        regexp_extract(filename, 'date=(\\d{{4}}-\\d{{2}}-\\d{{2}})', 1) AS day,
        size, entry_price
-FROM read_parquet('{glob}') AS t(user, market, size, notional, entry_price, filename)
+FROM read_parquet('{glob}', filename=true)
 WHERE market = '{symbol}' AND size <> 0 AND lower(user) IN ({in_list})
 ORDER BY wallet, day;
 """

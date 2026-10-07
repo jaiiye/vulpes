@@ -126,9 +126,13 @@ def _run_sql(sql: str, timeout: int = 1800) -> list[dict]:
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip().splitlines()
-        raise LeaderboardError(
-            f"duckdb failed: {detail[-1] if detail else 'no output'}"
+        # First non-empty line, not last: see the same note in
+        # `position_history._run_sql`. The last line of a binder error is the
+        # caret, so taking it reports "^" instead of the message.
+        message = next(
+            (line.strip() for line in detail if line.strip()), "no output"
         )
+        raise LeaderboardError(f"duckdb failed: {message}")
     text = proc.stdout.strip()
     if not text:
         return []
