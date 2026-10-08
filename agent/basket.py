@@ -55,6 +55,16 @@ class BasketConfig:
     #: 拉 K 线时留几根余量：信号要 lookback 根，再加当期一根。
     candle_margin: int = 2
 
+    # --- 篮子级风控。0 = 不限。见 `basket_risk.check_plan`。 ---
+    #: 建仓后毛名义的绝对上限。
+    max_gross_notional: float = 0.0
+    #: 毛名义相对账户权益的百分比上限。34 笔一起建，一次建错不是一笔止损的事。
+    max_gross_pct_of_equity: float = 0.0
+    #: 每条腿最多几个币。
+    max_legs_per_side: int = 0
+    #: 单笔名义低于这个就不下 —— venue 有最小 size，太小的单还占一个腿的名额。
+    min_leg_notional: float = 10.0
+
     @property
     def rows_needed(self) -> int:
         return self.lookback + self.candle_margin

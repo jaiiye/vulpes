@@ -159,48 +159,7 @@ class StateStore:
             return False
         state.version = STATE_VERSION
         state.saved_at = time.time()
-
-        tmp_path: str | None = None
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-
-            # A per-writer temp file rather than a fixed `<name>.tmp`. Two
-            # processes - a cron run and a manual run, which this project
-            # explicitly supports - would otherwise interleave into the same
-            # temp file and publish the mixture via `os.replace`.
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(self.path.parent),
-                prefix=f"{self.path.name}.",
-                suffix=".tmp",
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                # `allow_nan=False` refuses to emit `Infinity`/`NaN`. Those are
-                # not valid JSON, and a non-finite value read back would make
-                # every guardrail comparison silently false. Failing the save
-                # keeps the previous (valid) file instead of poisoning the next
-                # startup.
-                handle.write(
-                    json.dumps(asdict(state), default=str, allow_nan=False)
-                )
-                # Flush to the device before renaming. Without this the rename
-                # can be durable while the contents are not, so an unclean
-                # shutdown leaves a zero-length or truncated file behind.
-                handle.flush()
-                os.fsync(handle.fileno())
-
-            os.replace(tmp_path, self.path)
-            tmp_path = None
-            return True
-        except (OSError, ValueError, TypeError):
-            # A persistence failure must not take down the trading loop, but it
-            # does remove the restart protection, so the caller logs it.
-            return False
-        finally:
-            if tmp_path is not None:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
+        return atomic_write_json(self.path, asdict(state))
 
     def clear(self) -> None:
         if self.path is None:
@@ -209,6 +168,57 @@ class StateStore:
             self.path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Atomic write
+# ---------------------------------------------------------------------------
+def atomic_write_json(path: Path, payload: dict) -> bool:
+    """Write `payload` to `path` atomically. False on failure; never raises.
+
+    Extracted from `StateStore.save` so the basket persists through the same
+    path instead of growing a second copy of it. Every property below was
+    learned the hard way and is cheap to lose:
+
+      * A per-writer temp file, not a fixed `<name>.tmp`. Two processes - a
+        cron run and a manual run, which this project explicitly supports -
+        would otherwise interleave into the same temp file and publish the
+        mixture via `os.replace`.
+      * `allow_nan=False`. `Infinity`/`NaN` are not valid JSON, and a non-finite
+        value read back makes every guardrail comparison silently false, so a
+        single one disables the guardrail that reads it. Failing the save keeps
+        the previous valid file rather than poisoning the next startup.
+      * fsync before rename. Without it the rename can be durable while the
+        contents are not, so an unclean shutdown leaves a truncated file.
+      * Remove the temp file on failure, or they accumulate.
+
+    Returns False rather than raising because a persistence failure must not
+    take down the trading loop - but it does remove restart protection, so the
+    caller logs it.
+    """
+    tmp_path: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent),
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, default=str, allow_nan=False))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
