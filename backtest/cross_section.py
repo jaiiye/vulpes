@@ -480,30 +480,14 @@ class CrossSectionBacktester:
 
     # ------------------------------------------------------------------
     def _rank(self, row: int) -> tuple[set[str], set[str]] | None:
-        """Split the ranked universe into the two tails, or None to skip."""
-        cfg = self.cfg
-        scored: list[tuple[float, str]] = []
-        for s in self.panel.symbols:
-            if self.panel.price(s, row) is None:
-                continue
-            v = self.signal(self.panel, row, s)
-            if v is None or math.isnan(v):
-                continue
-            scored.append((v, s))
-        if len(scored) < cfg.min_symbols:
-            return None
-
-        scored.sort(key=lambda t: t[0])
-        k = max(1, int(len(scored) * cfg.quantile))
-        low = {s for _, s in scored[:k]}          # signal says "will fall"
-        high = {s for _, s in scored[-k:]}        # signal says "will rise"
-        if cfg.long_only:
-            # Long the high end, hold cash otherwise. No short leg at all.
-            return high, set()
-        # Short the low end, long the high end. The signal is direction-neutral:
-        # callers that mean "reversal" pass a negated momentum, they do not get
-        # a different portfolio builder.
-        return high, low
+        return rank_legs(
+            self.panel,
+            row,
+            self.signal,
+            quantile=self.cfg.quantile,
+            min_symbols=self.cfg.min_symbols,
+            long_only=self.cfg.long_only,
+        )
 
     def _leg_return(
         self, names: set[str], entry_row: int, exit_row: int
@@ -526,6 +510,47 @@ class CrossSectionBacktester:
         if not rets:
             return None
         return sum(rets) / len(rets)
+
+
+def rank_legs(
+    panel: "Panel",
+    row: int,
+    signal: "SignalFn",
+    quantile: float = 0.2,
+    min_symbols: int = 20,
+    long_only: bool = False,
+) -> tuple[set[str], set[str]] | None:
+    """Split the ranked universe into the two tails, or None to skip.
+
+    Module-level rather than a `CrossSectionBacktester` method because the live
+    basket ranks the same way the backtest does, and there must be exactly one
+    implementation of "which names go in a leg". A second copy - even one that
+    started as a faithful port - would let the two drift the first time one of
+    them was touched, and then a divergence between measured and live results
+    would be unattributable. `CrossSectionBacktester._rank` now calls this.
+    """
+    scored: list[tuple[float, str]] = []
+    for s in panel.symbols:
+        if panel.price(s, row) is None:
+            continue
+        v = signal(panel, row, s)
+        if v is None or math.isnan(v):
+            continue
+        scored.append((v, s))
+    if len(scored) < min_symbols:
+        return None
+
+    scored.sort(key=lambda t: t[0])
+    k = max(1, int(len(scored) * quantile))
+    low = {s for _, s in scored[:k]}          # signal says "will fall"
+    high = {s for _, s in scored[-k:]}        # signal says "will rise"
+    if long_only:
+        # Long the high end, hold cash otherwise. No short leg at all.
+        return high, set()
+    # Short the low end, long the high end. The signal is direction-neutral:
+    # callers that mean "reversal" pass a negated momentum, they do not get
+    # a different portfolio builder.
+    return high, low
 
 
 def _turnover(new: set[str], old: set[str]) -> float:

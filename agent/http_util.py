@@ -22,6 +22,14 @@ DEFAULT_TIMEOUT = 15
 DEFAULT_RETRIES = 3
 USER_AGENT = "fox-lite-agent/0.1"
 
+#: 4xx 里这几个是「等一下再来」而不是「请求错了」，所以值得重试。其余 4xx
+#: 重试无益（400/401/404 不会因为再发一次而变成 200）。
+#:
+#: 429 是篮子拉取时遇到的真问题：一次建仓要拉近 90 个币的 K 线，串着发会撞上
+#: 限速，而它被当成 4xx 直接抛出时，缺失的币就静默地少了 —— 池从 89 掉到 79，
+#: 腿从 17 掉到 15，而且掉哪些币取决于谁先撞上限速，不是随机的。
+RETRYABLE_4XX = frozenset({408, 425, 429})
+
 # Reading the body in chunks lets us retry a truncated transfer: a single
 # `resp.read()` that dies partway cannot be resumed, and the leaderboard
 # response is ~37 MB.
@@ -95,10 +103,14 @@ def request_json(
                 detail = exc.read().decode("utf-8")[:300]
             except Exception:  # pragma: no cover - best effort
                 pass
-            if exc.code < 500:
+            if exc.code < 500 and exc.code not in RETRYABLE_4XX:
                 raise HttpError(
                     f"{method} {url} -> HTTP {exc.code}: {detail}"
                 ) from exc
+            # 限速比服务端错误更需要等：同一个原因（发得太快）会让下一次尝试
+            # 也失败，所以 429 的退避加倍。
+            if exc.code == 429:
+                time.sleep(backoff * 2)
             last_error = exc
         except (
             urllib.error.URLError,
