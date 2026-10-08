@@ -127,5 +127,42 @@ class TestMeasure(unittest.TestCase):
         self.assertGreater(r["n_periods"], 0)
 
 
+class TestCapacity(unittest.TestCase):
+    def test_walk_cost_rises_with_size(self):
+        """A bigger order must cost more.
+
+        If a large size ever came back cheaper, the ladder would be reading a
+        median over the few deep names that could still fill it - the trap
+        `probe_spreads.py` documents, where $100k looked cheaper than $10k off
+        three surviving books.
+        """
+        vals = [v[0] for _, v in sorted(xc.WALK_BP.items())]
+        self.assertTrue(all(a < b for a, b in zip(vals, vals[1:])), vals)
+
+    def test_the_top_of_the_ladder_is_flagged_unfillable(self):
+        """$10k fills on 32 of 40 books, and its cost is a median over those
+        32 - the deep ones. Sizing the pool off that number would be pricing
+        the illiquid half at what only its liquid tail can do."""
+        _, (ok, tot) = xc.WALK_BP[max(xc.WALK_BP)]
+        self.assertLess(ok, tot)
+
+    def test_notional_and_participation_are_arithmetic(self):
+        """What the capacity table asserts: the notional is two legs of
+        `per_leg` orders, and participation is one order against a day of
+        that name's volume."""
+        series = {f"S{i:02d}": [10.0 + 0.01 * i * j for j in range(40)]
+                  for i in range(40)}
+        volumes = {s: [1000.0] * 40 for s in series}
+        rows, daily = xc.capacity_rows([make_panel(40, series, volumes)],
+                                       6, 6, 240, 10)
+        self.assertGreater(daily, 0.0)
+        self.assertEqual(len(rows), len(xc.WALK_BP))
+        for r in rows:
+            self.assertAlmostEqual(r["notional"], r["size"] * 10 * 2)
+            self.assertAlmostEqual(r["participation"], r["size"] / daily)
+            self.assertAlmostEqual(r["fee_total"],
+                                   r["walk"] + xc.TAKER_FEE_BP)
+
+
 if __name__ == "__main__":
     unittest.main()

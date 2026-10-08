@@ -61,6 +61,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from backtest import combine as cb  # noqa: E402
+from backtest import universe as U  # noqa: E402
 from backtest.cross_section import (  # noqa: E402
     CrossSectionBacktester,
     CrossSectionConfig,
@@ -88,6 +89,33 @@ DEFAULT_WINDOWS = 6
 DEFAULT_RUNS = 20
 DEFAULT_INTERVAL = 240
 DEFAULT_ARCHIVE = "data/canonical/candles"
+
+#: (one-way cost of walking the book in bp, books that could fill / sampled).
+#: Measured on live L2, illiquid half, n=40 names (`probe_spreads.py --sizes`
+#: 100 250 500 1000 2000 5000 10000 --fee-bps 3.2, 2026-10-08), fee excluded.
+#:
+#: This is what turns size into the free parameter and cost into a measurement
+#: instead of an assumption. Note the last row: at $10k only 32 of 40 books
+#: could fill at all, so that cost is already a median over the deep names -
+#: the true cost of trading the illiquid half at $10k is worse than 15.22 bp,
+#: and part of the pool simply cannot be traded there.
+WALK_BP = {
+    100: (2.95, (40, 40)),
+    250: (3.59, (40, 40)),
+    500: (4.28, (40, 40)),
+    1_000: (5.23, (40, 40)),
+    2_000: (6.09, (40, 40)),
+    5_000: (10.44, (39, 40)),
+    10_000: (15.22, (32, 40)),
+}
+
+#: Median taker fee, measured over 1.6e8 real fills (RESEARCH 26) - not the
+#: worst tier the repository used to assume.
+TAKER_FEE_BP = 3.2
+
+#: A basket taking more than this share of a name's daily dollar volume is
+#: moving the price it is trying to harvest. 5% is the conventional ceiling.
+PARTICIPATION = 0.05
 
 #: The pool is "every symbol trading at row `REF_ROW`", which is how the
 #: three-gate study in README/RESEARCH 18 defines it: 171 symbols, no coverage
@@ -234,6 +262,43 @@ def random_control(panels: list[Panel], hold: int, fee_bps: float,
     return out
 
 
+def capacity_rows(panels: list[Panel], lookback: int, hold: int,
+                  interval: int, per_leg: int) -> tuple[list[dict], float]:
+    """Where size, not cost, is what stops this basket.
+
+    Two independent limits, reported side by side because the question is
+    which one binds first:
+
+    * **cost** - the measured walk for that notional (`WALK_BP`) plus the
+      measured fee, fed through the same basket as the fee ladder;
+    * **participation** - the order as a share of a name's daily dollar
+      volume. Past a few percent of it the basket is moving the price it is
+      trying to harvest, and no amount of gross return pays for that, because
+      the walk cost measured on a resting book no longer describes the fill.
+    """
+    bars_per_day = 24 * 60.0 / interval
+    daily: list[float] = []
+    for p in panels:
+        # Median dollar volume per bar: a listing spike must not decide how
+        # much a name can absorb.
+        for v in U.liquidity_medians(p).values():
+            daily.append(v * bars_per_day)
+    med_daily = statistics.median(daily)
+
+    rows = []
+    for size, (walk, (ok, tot)) in sorted(WALK_BP.items()):
+        fee = walk + TAKER_FEE_BP
+        r = measure(panels, lookback, hold, fee)
+        r["size"] = size
+        r["walk"] = walk
+        r["fee_total"] = fee
+        r["participation"] = size / med_daily
+        r["notional"] = size * per_leg * 2
+        r["fillable"] = f"{ok}/{tot}"
+        rows.append(r)
+    return rows, med_daily
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--fees", type=float, nargs="+", default=list(DEFAULT_FEES))
@@ -247,6 +312,9 @@ def main() -> int:
     ap.add_argument("--archive", default=DEFAULT_ARCHIVE)
     ap.add_argument("--diagnose", action="store_true",
                     help="print the per-period distribution instead of a summary")
+    ap.add_argument("--capacity", action="store_true",
+                    help="sweep order size: measured walk cost and share of "
+                         "daily volume, against the net return they leave")
     args = ap.parse_args()
 
     coins = archive_coins(args.archive)
@@ -279,6 +347,34 @@ def main() -> int:
             r = measure(panels, args.lookback, args.hold, fee)
             print(f"  fee {fee:>6.2f}  gross  {spread(r['_gross'])}")
             print(f"  {'':>11s}  net    {spread(r['_net'])}")
+        return 0
+
+    if args.capacity:
+        rows, med_daily = capacity_rows(panels, args.lookback, args.hold,
+                                       args.interval, legs[-1])
+        print()
+        print(f"  median daily dollar volume per name  ${med_daily:,.0f}")
+        print(f"  gross notional at {legs[-1]} names per leg, "
+              f"both legs: {2 * legs[-1]} orders")
+        print()
+        print(f"  {'per name':>9s} {'walk':>6s} {'tot':>6s} {'cw med':>8s} "
+              f"{'period med':>11s} {'of daily':>9s} {'notional':>11s} "
+              f" {'books':>7s}")
+        for r in rows:
+            over = " <- over 5%" if r["participation"] > PARTICIPATION else ""
+            print(f"  ${int(r['size']):>8,} {r['walk']:>6.2f} "
+                  f"{r['fee_total']:>6.2f} {r['cw_median']:>8.2f} "
+                  f"{r['period_median']:>11.3f} "
+                  f"{r['participation'] * 100:>8.2f}% "
+                  f"${r['notional']:>10,.0f}  {r['fillable']:>7s}{over}")
+        cap = PARTICIPATION * med_daily
+        print()
+        print(f"  participation hits {PARTICIPATION:.0%} at "
+              f"${cap:,.0f} per name -> ${cap * 2 * legs[-1]:,.0f} notional")
+        print("  net return is still positive at every size measured here, so "
+              "what stops this")
+        print("  basket is how much the names can absorb, not what they cost "
+              "to trade")
         return 0
 
     print()
