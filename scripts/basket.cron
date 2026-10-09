@@ -1,0 +1,49 @@
+# Scheduled basket rebalance for the Hyperliquid agent.
+#
+# ==== DO NOT install this file with `crontab scripts/basket.cron` ====
+#
+# `crontab <file>` REPLACES the entire crontab, and the collection job is
+# already installed (collect.cron). Using it here would silently drop the
+# 15-minute data collection -- the job recording data that no API can serve
+# after the fact, and the one whose absence is noticed months later.
+#
+# Append this one line instead:
+#
+#   (crontab -l 2>/dev/null; echo '0 0 */3 * * /home/jaiiye/CodeBuddy/20260913183734/scripts/basket.sh >/dev/null 2>&1') | crontab -
+#
+# Then confirm both jobs are present (expect 2):
+#
+#   crontab -l | grep -cE '^\S+ \S+ \S+ \S+ \S+ '
+#
+# The SHELL / PATH / MAILTO lines below are already in the installed crontab,
+# so appending the single job line is enough.
+#
+# ---- Schedule: 00:00 UTC every 3 days ----
+#
+# Why a fixed wall-clock time and not "every 72h": cron has no relative
+# interval. hold=18 on 4h bars is 72h, so 3 days is the match, and 00:00 UTC
+# is a 4h bar boundary. Two consequences:
+#
+#   * Day-of-month `*/3` restarts on the 1st, so the gap across a month
+#     boundary is 1 or 2 days, not 3. The basket does not care -- it reads
+#     whatever the signal is when it runs -- but a period can be shorter than
+#     72h.
+#   * A missed slot is not made up. If the machine is off at 00:00, nothing
+#     replays that period; the next run builds from the later signal.
+#
+# ---- Mode ----
+#
+# Runs dry-run. Real orders need BASKET_LIVE=1 in the environment, which cron
+# does not inherit from an interactive shell -- put it on the job line:
+#
+#   BASKET_LIVE=1 0 0 */3 * * .../basket.sh >/dev/null 2>&1
+#
+# Every pass records its mode in logs/basket.log, so "was that period real" is
+# answerable from the log rather than from memory.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# min hour day month weekday   command
+0 0 */3 * * /home/jaiiye/CodeBuddy/20260913183734/scripts/basket.sh >/dev/null 2>&1
