@@ -11,9 +11,12 @@
 #
 #   (crontab -l 2>/dev/null; echo '0 0 */3 * * /home/jaiiye/CodeBuddy/20260913183734/scripts/basket.sh >/dev/null 2>&1') | crontab -
 #
-# Then confirm both jobs are present (expect 2):
+# Then confirm both jobs are present (expect 2). Count lines whose first field
+# looks like a schedule, not "lines with five words": the comment lines in
+# collect.cron have five words too, so the looser pattern counts those as well
+# and reports 7 for a crontab holding exactly these two jobs.
 #
-#   crontab -l | grep -cE '^\S+ \S+ \S+ \S+ \S+ '
+#   crontab -l | grep -cE '^(\*|[0-9])'
 #
 # The SHELL / PATH / MAILTO lines below are already in the installed crontab,
 # so appending the single job line is enough.
