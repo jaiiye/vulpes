@@ -265,14 +265,23 @@ def sweep(panels, broker, args) -> None:
 
     主指标用**年化**而不是「每期收益」：hold 加倍后每期收益本来就该更大，直接
     比每期会得出「越长越好」的错误结论。
+
+    成本有两路，不是同一个数字：重放是 dry-run broker 逐笔累加的真实费用（开仓
+    `entry_fee_usd` + 平仓 `exit_fee_usd`），回测是 `turnover × legs ×
+    charges_per_turnover × fee` 的公式。只有 `charges_per_turnover=2` 时两路才
+    可比；1 是历史口径，留着让 §二.28 那批数字还能复现。两路同时打印是因为
+    「两个独立算法算出同一个数」比其中任何一个单独成立都更有说服力 —— 而这也是
+    唯一能在不动历史结论的前提下检验那个公式的办法。
     """
+    charges_list = [int(x) for x in args.bt_charges.split(",")]
+    bt_headers = [f"回测c{c}" for c in charges_list]
     print(f"\n扫描 hold × quantile（fee {args.fee} bp/腿）")
     print(
         f"{'hold':>5} {'q':>5} {'期':>5} {'腿':>5} | "
         f"{'换手':>7} {'毛/期':>8} {'成本/期':>8} {'净/期':>8} | "
-        f"{'重放年化':>9} {'回测年化':>9}"
+        f"{'重放年化':>9} " + " ".join(f"{h:>9}" for h in bt_headers)
     )
-    print("-" * 78)
+    print("-" * (78 + 10 * (len(charges_list) - 1)))
     rows: list[tuple[float, int, float, float, float]] = []
 
     for hold in [int(x) for x in args.sweep_holds.split(",")]:
@@ -283,26 +292,28 @@ def sweep(panels, broker, args) -> None:
                 quantile=q,
                 per_coin_usd=args.per_coin,
             )
-            bt_cfg = CrossSectionConfig(
-                quantile=q,
-                min_symbols=cfg.min_symbols,
-                fee_bps=args.fee,
-                late_exit_factor=args.late_exit_factor,
-            )
             signal = negate(past_return(args.lookback))
 
             mine: list[dict] = []
-            bt_nets: list[float] = []
+            bt_nets: dict[int, list[float]] = {c: [] for c in charges_list}
             for p in panels:
                 res = replay_panel(
                     p, broker, cfg, args.lookback, hold, args.equity,
                     args.late_exit_factor,
                 )
                 mine.extend(res.periods)
-                bt = CrossSectionBacktester(
-                    p, signal, hold_rows=hold, config=bt_cfg
-                ).run()
-                bt_nets.extend(pr.net_return for pr in bt.periods)
+                for c in charges_list:
+                    bt_cfg = CrossSectionConfig(
+                        quantile=q,
+                        min_symbols=cfg.min_symbols,
+                        fee_bps=args.fee,
+                        late_exit_factor=args.late_exit_factor,
+                        charges_per_turnover=c,
+                    )
+                    bt = CrossSectionBacktester(
+                        p, signal, hold_rows=hold, config=bt_cfg
+                    ).run()
+                    bt_nets[c].extend(pr.net_return for pr in bt.periods)
 
             if not mine:
                 continue
@@ -312,12 +323,16 @@ def sweep(panels, broker, args) -> None:
             net = statistics.fmean(p["net"] for p in mine)
             legs = statistics.fmean(p["n_legs"] for p in mine)
             ann = net * per_year * 100.0
-            bt_ann = statistics.fmean(bt_nets) * per_year * 100.0
+            bt_ann = {
+                c: statistics.fmean(bt_nets[c]) * per_year * 100.0
+                for c in charges_list
+            }
             print(
                 f"{hold:>5} {q:>5.2f} {len(mine):>5} {legs:>5.1f} | "
                 f"{turnover * 100:>6.1f}% {net * 100 + cost * 100:>+7.3f}% "
                 f"{cost * 100:>7.3f}% {net * 100:>+7.3f}% | "
-                f"{ann:>+8.1f}% {bt_ann:>+8.1f}%"
+                f"{ann:>+8.1f}% "
+                + " ".join(f"{bt_ann[c]:>+8.1f}%" for c in charges_list)
             )
             rows.append((ann, hold, q, turnover, net))
 
@@ -334,6 +349,15 @@ def sweep(panels, broker, args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fee", type=float, default=3.2, help="bp per leg (taker)")
+    ap.add_argument(
+        "--bt-charges",
+        default="1,2",
+        help=(
+            "回测成本口径，逗号分隔：每单位换手收几次费。"
+            "1 = 只算开仓（历史口径，§二.28 那批数字），2 = 开+平（正确）。"
+            "默认两个都跑，用来和重放口径交叉验证。"
+        ),
+    )
     ap.add_argument("--windows", type=int, default=DEFAULT_WINDOWS)
     ap.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
     ap.add_argument("--hold", type=int, default=DEFAULT_HOLD)

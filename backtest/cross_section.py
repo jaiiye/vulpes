@@ -311,9 +311,29 @@ class CrossSectionConfig:
     #: Minimum ranked symbols for a period to trade at all. Below this the
     #: quantiles are a handful of names and the result is one symbol's move.
     min_symbols: int = 20
-    #: Fee per leg in basis points, charged on the notional traded. Entry and
-    #: exit are separate legs.
+    #: Fee per leg in basis points, charged on the notional traded. What counts
+    #: as a leg in `cost` is decided by `charges_per_turnover` -- see that field
+    #: before reading this number as a round-trip cost.
     fee_bps: float = 3.5
+    #: How many times one unit of turnover is charged: 1 = the entry only,
+    #: 2 = the entry and the exit.
+    #:
+    #: 2 is the default, and not on the general principle that the default
+    #: should be the correct one -- on the measured one below. Replacing a name
+    #: costs two fills, closing the old position and opening the new, and that
+    #: is confirmed independently rather than argued: replay_basket.py
+    #: accumulates the simulated broker's fees fill by fill (entry_fee_usd on
+    #: open, exit_fee_usd on close) and measures ~4 x turnover x fee, where 2x
+    #: is only half of it (§二.33: turnover 79.0% at fee 8.5bp costs
+    #: 0.261%/period; 4x predicts 0.269%, 2x only 0.134%).
+    #:
+    #: 1 exists to reproduce the older numbers. At 1 the backtester disagrees
+    #: with the replay by more than rounding and, on the configuration this
+    #: research started from, by more than magnitude: hold 6 reads +39.0%/yr at
+    #: 1 against -10.0% at 2 and -5.3% by replay. The old default did not just
+    #: inflate the number, it reported a profit where there was a loss -- and
+    #: it inflated in the one direction that argues for going live.
+    charges_per_turnover: int = 2
     #: What a symbol's exit price is worth when it has no bar at the exit row.
     #: 0.0 assumes total loss, which is the honest reading for a pair that stops
     #: trading; 1.0 assumes the position is closed at the last price seen, which
@@ -454,9 +474,14 @@ class CrossSectionBacktester:
             long_turn = _turnover(long_leg, prev_long)
             short_turn = 0.0 if cfg.long_only else _turnover(short_leg, prev_short)
             turnover = (long_turn + short_turn) / (1.0 if cfg.long_only else 2.0)
-            # Two legs, each turning over `turnover` of its notional.
+            # Two legs (long, short), each turning over `turnover` of its
+            # notional, each unit of turnover charged `charges_per_turnover`
+            # times -- see that field for why the default is 1.
             legs = 1.0 if cfg.long_only else 2.0
-            cost = turnover * legs * cfg.fee_bps / 10_000.0
+            cost = (
+                turnover * legs * cfg.charges_per_turnover
+                * cfg.fee_bps / 10_000.0
+            )
 
             result.periods.append(
                 PeriodResult(

@@ -192,7 +192,11 @@ class TestPortfolio(unittest.TestCase):
         r = CrossSectionBacktester(p, past_return(6), 5, cfg).run()
         first = r.periods[0]
         self.assertAlmostEqual(first.turnover, 1.0, places=9)
-        self.assertAlmostEqual(first.cost, 1.0 * 2 * 10.0 / 10_000.0, places=9)
+        # 100% turnover x 2 legs (long, short) x 2 charges (close the old
+        # position, open the new) -- see CrossSectionConfig.charges_per_turnover.
+        self.assertAlmostEqual(
+            first.cost, 1.0 * 2 * 2 * 10.0 / 10_000.0, places=9
+        )
 
     def test_holding_the_same_names_twice_costs_nothing_the_second_time(self):
         """A signal that never changes its ranking must not be charged turnover
@@ -234,7 +238,30 @@ class TestPortfolio(unittest.TestCase):
             self.assertEqual(period.n_short, 0)
             self.assertEqual(period.short_return, 0.0)
         # One leg, so the first period costs half of the two-leg case.
-        self.assertAlmostEqual(r.periods[0].cost, 10.0 / 10_000.0, places=9)
+        self.assertAlmostEqual(r.periods[0].cost, 2 * 10.0 / 10_000.0, places=9)
+
+    def test_charges_per_turnover_doubles_the_cost(self):
+        """§二.34: turnover used to be charged once, on the entry, which is half
+        the round trip -- the exit fill was never paid for. Both settings still
+        exist so the published numbers stay reproducible; what this pins down is
+        which one is the default and that the other is exactly half of it.
+        Getting this backwards does not raise, it halves every cost in the
+        backtester while every number still looks plausible."""
+        p = self.build()
+        common = dict(quantile=0.2, min_symbols=10, fee_bps=10.0)
+        self.assertEqual(
+            CrossSectionConfig(**common).charges_per_turnover, 2,
+            "默认必须是双边（开+平）；改成 1 等于让整套回测的成本静默减半",
+        )
+        once = CrossSectionBacktester(
+            p, past_return(6), 5,
+            CrossSectionConfig(**common, charges_per_turnover=1),
+        ).run()
+        twice = CrossSectionBacktester(
+            p, past_return(6), 5, CrossSectionConfig(**common)
+        ).run()
+        for a, b in zip(once.periods, twice.periods):
+            self.assertAlmostEqual(b.cost, 2 * a.cost, places=12)
 
 
 class TestDelisting(unittest.TestCase):
@@ -498,8 +525,14 @@ GROUP BY 1, 2 ORDER BY 2, 1;
         panel = restrict(panel, set(panel.present(60)))
         _, illiquid = liquid_split(panel)
 
+        # charges_per_turnover=1 pins the cost basis these numbers were published
+        # on. The default is now 2 -- §二.34 found the old one never charged the
+        # exit and, at hold 6, reported +39%/yr where the replay measured a loss
+        # -- but switching here would make a test named "reproduces the research"
+        # assert a different economy than the research actually used.
         cfg = CrossSectionConfig(
-            quantile=0.2, min_symbols=20, fee_bps=3.5, late_exit_factor=0.0
+            quantile=0.2, min_symbols=20, fee_bps=3.5, late_exit_factor=0.0,
+            charges_per_turnover=1,
         )
         subset = restrict(panel, illiquid)
         for (hold, lag), expected in self.EXPECTED.items():
@@ -561,8 +594,12 @@ GROUP BY 1, 2 ORDER BY 2, 1;
 
         panel = build_panel(json.loads(proc.stdout))
         panel = restrict(panel, set(panel.present(60)))
+        # charges_per_turnover=1, same reason as the parity test above: EXPECTED
+        # is what §二.6 reported, and this test re-runs that study rather than
+        # re-deriving it under today's default.
         cfg = CrossSectionConfig(
-            quantile=0.2, min_symbols=20, fee_bps=3.5, late_exit_factor=0.0
+            quantile=0.2, min_symbols=20, fee_bps=3.5, late_exit_factor=0.0,
+            charges_per_turnover=1,
         )
         sig = negate(past_return(42))
 
