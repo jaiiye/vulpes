@@ -34,6 +34,13 @@ INTERVAL_STR = "4h"
 #: 与 `cross_section_cost.DEFAULT_LOOKBACK` / `DEFAULT_HOLD` 一致，单位是 bar。
 DEFAULT_LOOKBACK = 6
 DEFAULT_HOLD = 6
+
+#: 实盘真正用的持有期（§二.33 实测优化的结论）。**刻意不等于** DEFAULT_HOLD：
+#: 6 是「对齐 IC 尺度」选的（IC 在 24h 上测），而最优持有是 72h —— 成本按交易
+#: 次数收、毛收益按持有时间长，所以成本一进来，对齐 IC 的尺度就不再是最优尺度。
+#: 实测：6 -> 年化 -5.3%，18 -> +55.7%，机制是每年交易次数从 365 降到 122。
+DEFAULT_HOLD_OPTIMIZED = 18
+
 #: 拉 K 线时每个币之间的间隔，理由见 `live_panel`。
 DEFAULT_PAUSE_SEC = 0.1
 
@@ -43,7 +50,9 @@ class BasketConfig:
     """篮子参数。默认值即回测跑过的那一组。"""
 
     lookback: int = DEFAULT_LOOKBACK
-    hold: int = DEFAULT_HOLD
+    #: 调仓间隔。默认取优化后的 72h，不是回测对齐 IC 的 24h，理由见
+    #: `DEFAULT_HOLD_OPTIMIZED`。
+    hold: int = DEFAULT_HOLD_OPTIMIZED
     quantile: float = 0.2
     min_symbols: int = 20
     #: 取流动性最差的这一半作为池。效应只在这一半里被测到。
