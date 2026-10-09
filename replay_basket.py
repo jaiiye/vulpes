@@ -250,6 +250,87 @@ def replay_panel(
     return result
 
 
+#: 4h bar -> 一年 2190 根。用来把「每期」折成「每年」，否则 hold 不同的配置
+#: 没法比（hold 加倍后每期收益本来就该更大）。
+BARS_PER_YEAR = 2190.0
+
+
+def sweep(panels, broker, args) -> None:
+    """扫描 hold × quantile。
+
+    为什么是这两个旋钮：毛收益是信号给的，动不了；成本 = 4 × turnover × fee，
+    所以唯一能动的只有换手率。hold 越长、quantile 越宽，篮子成员越稳，换手越低
+    —— 但两者都会稀释信号（持有更久 = 反转更弱；腿更宽 = 吃到更多中庸的币）。
+    所以这是一个要量才看得见的取舍，不能靠推理选。
+
+    主指标用**年化**而不是「每期收益」：hold 加倍后每期收益本来就该更大，直接
+    比每期会得出「越长越好」的错误结论。
+    """
+    print(f"\n扫描 hold × quantile（fee {args.fee} bp/腿）")
+    print(
+        f"{'hold':>5} {'q':>5} {'期':>5} {'腿':>5} | "
+        f"{'换手':>7} {'毛/期':>8} {'成本/期':>8} {'净/期':>8} | "
+        f"{'重放年化':>9} {'回测年化':>9}"
+    )
+    print("-" * 78)
+    rows: list[tuple[float, int, float, float, float]] = []
+
+    for hold in [int(x) for x in args.sweep_holds.split(",")]:
+        for q in [float(x) for x in args.sweep_quantiles.split(",")]:
+            cfg = BasketConfig(
+                lookback=args.lookback,
+                hold=hold,
+                quantile=q,
+                per_coin_usd=args.per_coin,
+            )
+            bt_cfg = CrossSectionConfig(
+                quantile=q,
+                min_symbols=cfg.min_symbols,
+                fee_bps=args.fee,
+                late_exit_factor=args.late_exit_factor,
+            )
+            signal = negate(past_return(args.lookback))
+
+            mine: list[dict] = []
+            bt_nets: list[float] = []
+            for p in panels:
+                res = replay_panel(
+                    p, broker, cfg, args.lookback, hold, args.equity,
+                    args.late_exit_factor,
+                )
+                mine.extend(res.periods)
+                bt = CrossSectionBacktester(
+                    p, signal, hold_rows=hold, config=bt_cfg
+                ).run()
+                bt_nets.extend(pr.net_return for pr in bt.periods)
+
+            if not mine:
+                continue
+            per_year = BARS_PER_YEAR / hold
+            turnover = statistics.fmean(p["turnover"] for p in mine)
+            cost = statistics.fmean(p["cost"] for p in mine)
+            net = statistics.fmean(p["net"] for p in mine)
+            legs = statistics.fmean(p["n_legs"] for p in mine)
+            ann = net * per_year * 100.0
+            bt_ann = statistics.fmean(bt_nets) * per_year * 100.0
+            print(
+                f"{hold:>5} {q:>5.2f} {len(mine):>5} {legs:>5.1f} | "
+                f"{turnover * 100:>6.1f}% {net * 100 + cost * 100:>+7.3f}% "
+                f"{cost * 100:>7.3f}% {net * 100:>+7.3f}% | "
+                f"{ann:>+8.1f}% {bt_ann:>+8.1f}%"
+            )
+            rows.append((ann, hold, q, turnover, net))
+
+    print("-" * 78)
+    rows.sort(reverse=True)
+    print("\n按重放年化排序：")
+    for ann, hold, q, turnover, net in rows:
+        print(
+            f"  hold {hold:>2} q {q:.2f}  年化 {ann:>+7.1f}%  "
+            f"换手 {turnover * 100:.1f}%  净/期 {net * 100:+.3f}%"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fee", type=float, default=3.2, help="bp per leg (taker)")
@@ -269,6 +350,9 @@ def main() -> None:
     ap.add_argument("--archive", default=ARCHIVE)
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--json", help="write per-period detail")
+    ap.add_argument("--sweep", action="store_true", help="scan hold x quantile")
+    ap.add_argument("--sweep-holds", default="6,12,18,24")
+    ap.add_argument("--sweep-quantiles", default="0.2,0.3,0.4")
     args = ap.parse_args()
 
     cfg = BasketConfig(
@@ -302,6 +386,10 @@ def main() -> None:
         fee_bps=args.fee,
         late_exit_factor=args.late_exit_factor,
     )
+
+    if args.sweep:
+        sweep(panels, broker, args)
+        return
 
     print(
         f"\n{'窗口':>4} {'币':>4} {'期':>4} | "
